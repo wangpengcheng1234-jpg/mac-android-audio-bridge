@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# 构建产物
+dist/
+build/
+*.test
+*.dSYM/
+
+# 本地依赖（体积大，请按 README 自行下载 scrcpy）
+scrcpy/
+
+# 调试截图
+.screenshots/
+*.log
+
+# 个人使用说明（含本机路径 / IP，不入库）
+mac蓝牙音频+本次项目产生文件说明.md
+
+# 图标中间产物（保留 icon.icns 与 icon.jpg 即可）
+assets/icon.iconset/
