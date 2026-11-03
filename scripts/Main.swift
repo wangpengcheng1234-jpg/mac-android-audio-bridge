@@ -286,9 +286,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelsRow.translatesAutoresizingMaskIntoConstraints = false
 
         // —— 音频参数（卡顿 / 电流声调这里，改动后重新 START 生效）
-        let bufferOptions = ["50 ms", "100 ms", "200 ms"]
+        let bufferOptions = ["50 ms", "100 ms", "200 ms", "350 ms", "500 ms"]
         let bitrateOptions = ["96K", "128K", "192K"]
-        let codecOptions = ["opus", "aac", "flac"]
+        let codecOptions = ["opus", "aac", "flac", "raw"]
 
         func savedIndex(_ key: String, _ options: [String], fallback: Int) -> Int {
             if let s = UserDefaults.standard.string(forKey: key), let i = options.firstIndex(of: s) { return i }
@@ -302,7 +302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popup.translatesAutoresizingMaskIntoConstraints = false
             popup.widthAnchor.constraint(equalToConstant: 86).isActive = true
         }
-        setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 1))
+        setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 2))
         setupPopup(bitratePopup, bitrateOptions, savedIndex("audioBitrate", bitrateOptions, fallback: 1))
         setupPopup(codecPopup, codecOptions, savedIndex("audioCodec", codecOptions, fallback: 0))
         codecValue.stringValue = (codecPopup.titleOfSelectedItem ?? "opus").uppercased() + " · 48 kHz · 立体声"
@@ -622,10 +622,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(codec, forKey: "audioCodec")
 
             // --no-window：scrcpy 即使只放音频，也会新建一个以设备名为标题的窗口，这里彻底关掉
-            p.arguments = ["-s", device, "--no-video", "--no-control", "--no-window",
-                           "--audio-buffer=\(bufferMs)",
-                           "--audio-bit-rate=\(bitrateK)K",
-                           "--audio-codec=\(codec)"]
+            // 码率只对 opus/aac 有效，flac/raw 是无损，scrcpy 不接受 --audio-bit-rate
+            var args = ["-s", device, "--no-video", "--no-control", "--no-window",
+                        "--audio-buffer=\(bufferMs)", "--audio-codec=\(codec)"]
+            if codec == "opus" || codec == "aac" {
+                args.append("--audio-bit-rate=\(bitrateK)K")
+            }
+            p.arguments = args
             p.currentDirectoryURL = URL(fileURLWithPath: dir)
 
             // scrcpy 自带一份 adb，会抢 5037 端口导致找不到设备；强制指定用 SDK 里的 adb
