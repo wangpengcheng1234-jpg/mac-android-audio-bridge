@@ -305,7 +305,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 2))
         setupPopup(bitratePopup, bitrateOptions, savedIndex("audioBitrate", bitrateOptions, fallback: 1))
         setupPopup(codecPopup, codecOptions, savedIndex("audioCodec", codecOptions, fallback: 0))
-        codecValue.stringValue = (codecPopup.titleOfSelectedItem ?? "opus").uppercased() + " · 48 kHz · 16bit · 立体声（系统固定）"
+        codecPopup.target = self
+        codecPopup.action = #selector(codecChanged)
+        codecChanged()
 
         func settingGroup(_ title: String, _ popup: NSPopUpButton) -> NSStackView {
             let label = textLabel(title, color: C_DIM, size: 11)
@@ -542,8 +544,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 传输中禁用参数下拉（改动需重新 START 才生效）
     func setSettingsEnabled(_ on: Bool) {
         bufferPopup.isEnabled = on
-        bitratePopup.isEnabled = on
         codecPopup.isEnabled = on
+        if on { codecChanged() } else { bitratePopup.isEnabled = false }
+    }
+
+    /// 无损编码（raw/flac）的码率由 48kHz×16bit×2 声道决定，不可调：
+    /// Bitrate 下拉此时只显示固定值并禁用；切回有损编码时恢复完整列表
+    @objc func codecChanged() {
+        let codec = codecPopup.titleOfSelectedItem ?? "opus"
+        let losslessFixed: [String: String] = ["raw": "1536K", "flac": "≈800K"]
+        if let fixed = losslessFixed[codec] {
+            bitratePopup.removeAllItems()
+            bitratePopup.addItem(withTitle: fixed)
+            bitratePopup.selectItem(at: 0)
+            bitratePopup.isEnabled = false
+        } else if bitratePopup.numberOfItems <= 1 {
+            let opts = ["96K", "128K", "192K", "256K", "320K"]
+            let saved = UserDefaults.standard.string(forKey: "audioBitrate") ?? "192K"
+            bitratePopup.removeAllItems()
+            bitratePopup.addItems(withTitles: opts)
+            bitratePopup.selectItem(at: opts.firstIndex(of: saved) ?? 2)
+            bitratePopup.isEnabled = true
+        }
+        codecValue.stringValue = codec.uppercased() + " · 48 kHz · 16bit · 立体声（系统固定）"
     }
 
     @objc func actionTapped() {
@@ -618,7 +641,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let bitrateK = (self.bitratePopup.titleOfSelectedItem ?? "128K").replacingOccurrences(of: "K", with: "")
             let codec = self.codecPopup.titleOfSelectedItem ?? "opus"
             UserDefaults.standard.set(self.bufferPopup.titleOfSelectedItem, forKey: "audioBuffer")
-            UserDefaults.standard.set(self.bitratePopup.titleOfSelectedItem, forKey: "audioBitrate")
+            // 无损编码时 Bitrate 显示的是固定值（1536K/≈800K），不要把显示值存成用户选择
+            if self.bitratePopup.isEnabled {
+                UserDefaults.standard.set(self.bitratePopup.titleOfSelectedItem, forKey: "audioBitrate")
+            }
             UserDefaults.standard.set(codec, forKey: "audioCodec")
 
             // --no-window：scrcpy 即使只放音频，也会新建一个以设备名为标题的窗口，这里彻底关掉
