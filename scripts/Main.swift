@@ -156,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let deviceValue   = textLabel("—", color: C_MAGENTA, size: 12, bold: true)
     let statusValue   = textLabel("IDLE", color: C_YELLOW, size: 12, bold: true)
     let transportValue = textLabel("—", color: C_WHITE, size: 12)
-    let codecValue    = textLabel("OPUS · 48 kHz · 立体声", color: C_WHITE, size: 12)
+    let codecValue    = textLabel("OPUS · 48 kHz · 16bit · 立体声（系统固定）", color: C_WHITE, size: 12)
     let dataValue     = textLabel("0.0 MB", color: C_BLUE, size: 12, bold: true)
     let uptimeValue   = textLabel("00:00", color: C_WHITE, size: 12)
 
@@ -305,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 2))
         setupPopup(bitratePopup, bitrateOptions, savedIndex("audioBitrate", bitrateOptions, fallback: 1))
         setupPopup(codecPopup, codecOptions, savedIndex("audioCodec", codecOptions, fallback: 0))
-        codecValue.stringValue = (codecPopup.titleOfSelectedItem ?? "opus").uppercased() + " · 48 kHz · 立体声"
+        codecValue.stringValue = (codecPopup.titleOfSelectedItem ?? "opus").uppercased() + " · 48 kHz · 16bit · 立体声（系统固定）"
 
         func settingGroup(_ title: String, _ popup: NSPopUpButton) -> NSStackView {
             let label = textLabel(title, color: C_DIM, size: 11)
@@ -668,7 +668,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.statusValue.stringValue = "STREAMING"
                 self.statusValue.textColor = C_GREEN
-                self.codecValue.stringValue = codec.uppercased() + " · 48 kHz · 立体声"
+                self.codecValue.stringValue = codec.uppercased() + " · 48 kHz · 16bit · 立体声（系统固定）"
                 self.actionButton.title = "■  STOP BRIDGE"
                 self.actionButton.bezelColor = NSColor(calibratedRed: 0.62, green: 0.16, blue: 0.16, alpha: 1)
                 self.actionButton.isEnabled = true
