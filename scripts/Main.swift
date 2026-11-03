@@ -287,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // —— 音频参数（卡顿 / 电流声调这里，改动后重新 START 生效）
         let bufferOptions = ["50 ms", "100 ms", "200 ms", "350 ms", "500 ms"]
-        let bitrateOptions = ["96K", "128K", "192K"]
+        let bitrateOptions = ["96K", "128K", "192K", "256K", "320K"]
         let codecOptions = ["opus", "aac", "flac", "raw"]
 
         func savedIndex(_ key: String, _ options: [String], fallback: Int) -> Int {
