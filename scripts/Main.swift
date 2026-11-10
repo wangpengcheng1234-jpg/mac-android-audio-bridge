@@ -167,6 +167,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let outHint  = textLabel("Mac 音频输出", color: C_DIM, size: 11)
     let rttValue = textLabel("— ms", color: C_BLUE, size: 13, bold: true)
     let rttHint  = textLabel("实测 WiFi 往返耗时", color: C_DIM, size: 11)
+    let awdlValue = textLabel("检测中…", color: C_DIM, size: 12)
+    let awdlButton: NSButton = {
+        let b = NSButton(title: "—", target: nil, action: nil)
+        b.bezelStyle = .rounded
+        b.controlSize = .small
+        b.font = .systemFont(ofSize: 11)
+        return b
+    }()
+    var awdlIsUp = true
 
     let actionButton = NSButton()
     let bufferPopup = NSPopUpButton()
@@ -174,6 +183,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let codecPopup = NSPopUpButton()
 
     var process: Process?
+    /// 当前传输使用的 adb 序列号（含 ":" 为 Wi-Fi，否则为 USB）；nil 表示未在传输
+    var activeDevice: String?
     var pollTimer: Timer?
     var uiTimer: Timer?
     var startTime: Date?
@@ -187,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshOutputDevice()
         refreshVolume()
         refreshRTT()
+        refreshAWDL()
         // 上一次若异常退出，手机上可能留着 scrcpy 采集进程（会让手机一直没声音），启动时先清掉
         DispatchQueue.global().async { self.cleanupPhoneServer() }
     }
@@ -200,7 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func buildWindow() {
-        let rect = NSRect(x: 0, y: 0, width: 660, height: 486)
+        let rect = NSRect(x: 0, y: 0, width: 660, height: 504)
         window = NSWindow(contentRect: rect,
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false)
@@ -260,6 +272,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rttRow.spacing = 8
         rttRow.alignment = .centerY
 
+        awdlButton.target = self
+        awdlButton.action = #selector(awdlClicked)
+        let awdlRow = NSStackView(views: [textLabel("AWDL:", color: C_DIM, size: 12), awdlValue, awdlButton])
+        awdlRow.orientation = .horizontal
+        awdlRow.spacing = 8
+        awdlRow.alignment = .centerY
+
         let rightRows: [NSView] = [
             textLabel("Mac Volume:", color: C_DIM, size: 12),
             volRow,
@@ -267,7 +286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             outValue,
             outHint,
             textLabel("Network Latency:", color: C_DIM, size: 12),
-            rttRow
+            rttRow,
+            awdlRow
         ]
         let rightPanel = PanelView(title: " Performance & Levels ", borderColor: C_BORDER)
         let rightInner = panelContent(rightRows)
@@ -368,7 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelsRow.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
             panelsRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
             panelsRow.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
-            panelsRow.heightAnchor.constraint(equalToConstant: 222),
+            panelsRow.heightAnchor.constraint(equalToConstant: 240),
 
             settingsRow.topAnchor.constraint(equalTo: panelsRow.bottomAnchor, constant: 12),
             settingsRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
@@ -494,9 +514,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: 操作
 
+    /// 读取 awdl0 接口当前状态并刷新 UI（flags 里含 UP 即运行中）
+    func refreshAWDL() {
+        DispatchQueue.global().async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
+            p.arguments = ["awdl0"]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            do { try p.run(); p.waitUntilExit() } catch {}
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            var exists = false
+            var isUp = false
+            if let l = out.range(of: "<"), let r = out.range(of: ">", range: l.upperBound..<out.endIndex) {
+                exists = true
+                isUp = out[l.upperBound..<r.lowerBound].split(separator: ",").contains("UP")
+            }
+            DispatchQueue.main.async {
+                self.awdlIsUp = isUp
+                if !exists {
+                    self.awdlValue.stringValue = "不可用"
+                    self.awdlValue.textColor = C_DIM
+                    self.awdlButton.isEnabled = false
+                } else {
+                    self.awdlValue.stringValue = isUp ? "运行中（抖动尖峰风险）" : "已关闭 · 低抖动"
+                    self.awdlValue.textColor = isUp ? C_YELLOW : C_GREEN
+                    self.awdlButton.title = isUp ? "关闭" : "恢复"
+                    self.awdlButton.isEnabled = true
+                }
+            }
+        }
+    }
+
+    /// AWDL 开关：关闭前确认代价；通过 osascript 管理员授权执行 ifconfig（系统弹密码框）
+    @objc func awdlClicked() {
+        if awdlIsUp {
+            let alert = NSAlert()
+            alert.messageText = "关闭 AWDL（AirDrop 无线直连）？"
+            alert.informativeText = "关闭可降低 Wi-Fi 延迟尖峰，但「隔空投送 / 接力 / 通用剪贴板」将不可用。\n\n随时可点「恢复」还原；重启 Mac 也会自动恢复。"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "关闭 AWDL")
+            alert.addButton(withTitle: "取消")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        setAWDL(up: !awdlIsUp)
+    }
+
+    func setAWDL(up: Bool) {
+        awdlButton.isEnabled = false
+        awdlValue.stringValue = "处理中…（系统会弹密码框）"
+        DispatchQueue.global().async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            p.arguments = ["-e", "do shell script \"/sbin/ifconfig awdl0 \(up ? "up" : "down")\" with administrator privileges"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            do { try p.run(); p.waitUntilExit() } catch {}
+            // 取消授权或密码错误时状态不变，refreshAWDL 会把 UI 刷回真实状态
+            DispatchQueue.main.async { self.refreshAWDL() }
+        }
+    }
+
     /// 实测 WiFi 往返延迟（ping 手机 IP）
     func refreshRTT() {
-        let ip = lastIP
+        // USB 直连：音频不走网络，ping Wi-Fi IP 没有意义（用户反馈过这个困惑）
+        if let dev = activeDevice, !dev.contains(":") {
+            rttValue.stringValue = "USB 直连"
+            rttValue.textColor = C_GREEN
+            rttHint.stringValue = "无网络传输 · 抖动≈0 · 缓冲按最低档 50ms"
+            rttHint.textColor = C_DIM
+            return
+        }
+        let ip = activeDevice.flatMap { $0.contains(":") ? String($0.split(separator: ":")[0]) : nil } ?? lastIP
         guard !ip.isEmpty else {
             rttValue.stringValue = "— ms"
             rttValue.textColor = C_DIM
@@ -678,6 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let isWireless = device.contains(":")
             if isWireless { lastIP = String(device.split(separator: ":")[0]) }
+            self.activeDevice = device
             DispatchQueue.main.async {
                 self.deviceValue.stringValue = device
                 self.transportValue.stringValue = isWireless ? "Wi-Fi (adb tcpip)" : "USB (adb)"
@@ -917,6 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uiTimer?.invalidate(); uiTimer = nil
         process = nil
         startTime = nil
+        activeDevice = nil
         statusValue.stringValue = "IDLE"
         statusValue.textColor = C_YELLOW
         transportValue.stringValue = "手机需与 Mac 同一 Wi-Fi"
