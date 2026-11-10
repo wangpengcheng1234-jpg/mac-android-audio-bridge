@@ -286,7 +286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelsRow.translatesAutoresizingMaskIntoConstraints = false
 
         // —— 音频参数（卡顿 / 电流声调这里，改动后重新 START 生效）
-        let bufferOptions = ["50 ms", "100 ms", "200 ms", "350 ms", "500 ms"]
+        // Auto：启动前实测网络抖动，自动选最低可用缓冲（推荐）
+        let bufferOptions = ["Auto", "50 ms", "100 ms", "200 ms", "350 ms", "500 ms"]
         let bitrateOptions = ["96K", "128K", "192K", "256K", "320K"]
         let codecOptions = ["opus", "aac", "flac", "raw"]
 
@@ -302,7 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popup.translatesAutoresizingMaskIntoConstraints = false
             popup.widthAnchor.constraint(equalToConstant: 86).isActive = true
         }
-        setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 2))
+        setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 0))
         setupPopup(bitratePopup, bitrateOptions, savedIndex("audioBitrate", bitrateOptions, fallback: 1))
         setupPopup(codecPopup, codecOptions, savedIndex("audioCodec", codecOptions, fallback: 0))
         codecPopup.target = self
@@ -510,6 +511,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p.standardError = FileHandle.nullDevice
 
             var avg: Double?
+            var minRtt: Double?
+            var maxRtt: Double?
             do {
                 try p.run()
                 p.waitUntilExit()
@@ -517,8 +520,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let r = out.range(of: "round-trip"),
                    let eq = out[r.upperBound...].firstIndex(of: "=") {
                     let parts = out[out.index(after: eq)...].split(separator: "/")
-                    if parts.count >= 2 {
+                    if parts.count >= 3 {
+                        minRtt = Double(parts[0].trimmingCharacters(in: .whitespaces))
                         avg = Double(parts[1].trimmingCharacters(in: .whitespaces))
+                        maxRtt = Double(parts[2].trimmingCharacters(in: .whitespacesAndNewlines))
                     }
                 }
             } catch {
@@ -529,7 +534,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let ms = avg {
                     self.rttValue.stringValue = String(format: "%.1f ms", ms)
                     self.rttValue.textColor = ms < 30 ? C_GREEN : (ms < 80 ? C_YELLOW : C_RED)
-                    self.rttHint.stringValue = "往返/2 ≈ 单向"
+                    // 抖动 = 最坏 - 最好，直接决定缓冲要多大才不卡；越大网络越不稳
+                    if let lo = minRtt, let hi = maxRtt {
+                        self.rttHint.stringValue = String(format: "抖动 %.0f ms · 建议缓冲 ≥ %.0f ms", hi - lo, hi + 20)
+                    } else {
+                        self.rttHint.stringValue = "往返/2 ≈ 单向"
+                    }
                     self.rttHint.textColor = C_DIM
                 } else {
                     self.rttValue.stringValue = "不可达"
@@ -539,6 +549,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    /// Auto 缓冲：启动前快速 ping 手机 8 包，按「最坏 RTT + 20ms 余量」选缓冲（钳制 50~500ms）。
+    /// 缓冲要对抗的是网络抖动，最坏 RTT 就是必须囤住的水位；USB 无网络传输，直接用最小值。
+    func measureAutoBuffer(device: String) -> Int {
+        guard device.contains(":") else { return 50 }
+        let ip = String(device.split(separator: ":")[0])
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/sbin/ping")
+        p.arguments = ["-c", "8", "-i", "0.2", "-q", ip]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            if let r = out.range(of: "round-trip"),
+               let eq = out[r.upperBound...].firstIndex(of: "=") {
+                let parts = out[out.index(after: eq)...].split(separator: "/")
+                if parts.count >= 3,
+                   let maxRtt = Double(parts[2].trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    let chosen = min(500, max(50, Int(maxRtt.rounded()) + 20))
+                    DispatchQueue.main.async {
+                        self.rttHint.stringValue = "Auto 缓冲 → \(chosen) ms（最坏 RTT \(Int(maxRtt)) ms）"
+                        self.rttHint.textColor = C_CYAN
+                    }
+                    return chosen
+                }
+            }
+        } catch {}
+        // 测量失败（手机 ICMP 被拦等）→ 取保守中间值
+        DispatchQueue.main.async {
+            self.rttHint.stringValue = "Auto 测量失败 → 200 ms"
+            self.rttHint.textColor = C_YELLOW
+        }
+        return 200
     }
 
     /// 传输中禁用参数下拉（改动需重新 START 才生效）
@@ -637,7 +684,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p.executableURL = URL(fileURLWithPath: dir + "/scrcpy")
 
             // 音频参数：缓冲越大越抗卡顿（延迟也越高）；码率越高越清晰；flac/raw 无损但更吃带宽
-            let bufferMs = (self.bufferPopup.titleOfSelectedItem ?? "100 ms").replacingOccurrences(of: " ms", with: "")
+            let bufferChoice = self.bufferPopup.titleOfSelectedItem ?? "Auto"
+            let bufferMs: String
+            if bufferChoice == "Auto" {
+                DispatchQueue.main.async { self.statusValue.stringValue = "MEASURING…" }
+                bufferMs = String(self.measureAutoBuffer(device: device))
+            } else {
+                bufferMs = bufferChoice.replacingOccurrences(of: " ms", with: "")
+            }
             let bitrateK = (self.bitratePopup.titleOfSelectedItem ?? "128K").replacingOccurrences(of: "K", with: "")
             let codec = self.codecPopup.titleOfSelectedItem ?? "opus"
             UserDefaults.standard.set(self.bufferPopup.titleOfSelectedItem, forKey: "audioBuffer")
@@ -649,8 +703,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             // --no-window：scrcpy 即使只放音频，也会新建一个以设备名为标题的窗口，这里彻底关掉
             // 码率只对 opus/aac 有效，flac/raw 是无损，scrcpy 不接受 --audio-bit-rate
+            // --audio-output-buffer=10：SDL 播放侧缓冲默认 5ms 偏激进易欠载破音，提到 10ms（代价仅 5ms）
             var args = ["-s", device, "--no-video", "--no-control", "--no-window",
-                        "--audio-buffer=\(bufferMs)", "--audio-codec=\(codec)"]
+                        "--audio-buffer=\(bufferMs)", "--audio-output-buffer=10", "--audio-codec=\(codec)"]
             if codec == "opus" || codec == "aac" {
                 args.append("--audio-bit-rate=\(bitrateK)K")
             }
