@@ -1,5 +1,6 @@
 import Cocoa
 import CoreAudio
+import Network
 
 /// scrcpy 目录查找顺序：用户设置 → App 内置 Resources/scrcpy → ~/scrcpy → ~/Downloads
 func findScrcpyDir() -> String? {
@@ -155,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let deviceValue   = textLabel("—", color: C_MAGENTA, size: 12, bold: true)
     let statusValue   = textLabel("IDLE", color: C_YELLOW, size: 12, bold: true)
-    let transportValue = textLabel("—", color: C_WHITE, size: 12)
+    let transportValue = textLabel("手机需与 Mac 同一 Wi-Fi", color: C_DIM, size: 12)
     let codecValue    = textLabel("OPUS · 48 kHz · 16bit · 立体声（系统固定）", color: C_WHITE, size: 12)
     let dataValue     = textLabel("0.0 MB", color: C_BLUE, size: 12, bold: true)
     let uptimeValue   = textLabel("00:00", color: C_WHITE, size: 12)
@@ -657,16 +658,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 dev = self.findDevice()
             }
             guard let device = dev else {
+                // 连接失败：自动诊断是「手机不在局域网」还是「手机重启导致无线调试失效」
+                let (hint, steps) = lastIP.isEmpty ? ("", "") : self.diagnoseConnection(ip: lastIP)
                 DispatchQueue.main.async {
                     if lastIP.isEmpty {
                         self.askForPhoneIP()
                     } else {
                         self.statusValue.stringValue = "NO DEVICE"
                         self.statusValue.textColor = C_RED
-                        self.deviceValue.stringValue = "未找到手机"
-                        self.transportValue.stringValue = "检查 Wi-Fi / 无线调试"
+                        self.deviceValue.stringValue = hint
+                        self.transportValue.stringValue = "详见弹窗排查步骤"
                         self.actionButton.title = "▶  START BRIDGE"
                         self.actionButton.isEnabled = true
+                        self.showConnectionFailureAlert(hint: hint, steps: steps, ip: lastIP)
                     }
                 }
                 return
@@ -763,6 +767,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 连不上手机时自动诊断，返回（一句话原因，排查步骤）。
+    /// 先 ping：不通说明手机根本不在局域网；通但 5555 关说明手机重启过、adb tcpip 已失效。
+    func diagnoseConnection(ip: String) -> (String, String) {
+        if !pingReachable(ip) {
+            return ("手机不在局域网",
+                    "手机可能没连 Wi-Fi、换了网络，或 IP 已变化。\n\n" +
+                    "排查：\n" +
+                    "1. 手机「设置 → WLAN」确认已连接，且和 Mac 是同一个 Wi-Fi\n" +
+                    "2. 查看手机当前 IP，可能已不是 \(ip)（DHCP 重启后可能换 IP）\n" +
+                    "3. 确认路由器没有开「AP 隔离/客户端隔离」")
+        }
+        if !tcpReachable(ip, port: 5555, timeout: 2) {
+            return ("无线调试已关闭（手机可能重启过）",
+                    "adb tcpip 模式在手机重启后自动失效，这是正常现象。\n\n" +
+                    "恢复方法（任选其一）：\n" +
+                    "1. 用 USB 线把手机连上 Mac，App 会自动检测到并恢复\n" +
+                    "2. 或在手机「开发者选项」里重新打开「无线调试」")
+        }
+        return ("手机在线但 adb 无法连接",
+                "手机和端口都正常，但 adb 握手失败。\n\n" +
+                "排查：\n" +
+                "1. 再点一次 START BRIDGE 重试（Mac 的 adb 服务偶尔卡死，App 已自动重启过它）\n" +
+                "2. 手机「开发者选项」里重新开关一次「USB 调试」\n" +
+                "3. 若手机弹过「是否允许这台电脑调试」，勾选一律允许并确认")
+    }
+
+    /// ping 一次判断是否可达（2 个包，任意一个回包即算通）
+    func pingReachable(_ ip: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/sbin/ping")
+        p.arguments = ["-c", "2", "-W", "1000", "-q", ip]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch { return false }
+        return p.terminationStatus == 0
+    }
+
+    /// TCP 端口探测（NWConnection 同步化，最多等 timeout 秒）
+    func tcpReachable(_ host: String, port: UInt16, timeout: TimeInterval) -> Bool {
+        guard let ep = NWEndpoint.Port(rawValue: port) else { return false }
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: ep, using: .tcp)
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready: ok = true; sem.signal()
+            case .failed, .cancelled: sem.signal()
+            default: break
+            }
+        }
+        conn.start(queue: .global())
+        _ = sem.wait(timeout: .now() + timeout)
+        conn.cancel()
+        return ok
+    }
+
+    /// 连接失败弹窗：给出诊断结果与排查步骤，并允许直接重填 IP
+    func showConnectionFailureAlert(hint: String, steps: String, ip: String) {
+        let alert = NSAlert()
+        alert.messageText = "连不上手机（\(ip)）"
+        alert.informativeText = steps
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "知道了")
+        alert.addButton(withTitle: "重新输入手机 IP")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            self.askForPhoneIP()
+        }
+    }
+
     /// 首次使用（没有 USB 设备、也没记过 IP）时，让用户填手机 IP
     func askForPhoneIP() {
         let alert = NSAlert()
@@ -845,6 +919,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startTime = nil
         statusValue.stringValue = "IDLE"
         statusValue.textColor = C_YELLOW
+        transportValue.stringValue = "手机需与 Mac 同一 Wi-Fi"
+        transportValue.textColor = C_DIM
         uptimeValue.stringValue = "00:00"
         dataValue.stringValue = "0.0 MB"
         actionButton.title = "▶  START BRIDGE"
