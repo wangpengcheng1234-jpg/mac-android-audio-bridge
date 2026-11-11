@@ -23,6 +23,7 @@ macOS 的蓝牙栈**不提供 A2DP Sink（接收端）**角色：系统设置里
 - **真实延迟测量**：定时 `ping` 手机，显示 WiFi 往返 RTT（颜色分档）
 - **自动恢复手机声音**：启动/停止/关窗都会清理手机端残留的 `scrcpy-server` 进程，避免"电脑关了手机反而没声音"
 - **自动找设备**：优先 USB，其次用记住的 IP 走无线；失效会自动重启 adb 服务重试
+- **应用播放采集**：默认使用 `--audio-source=playback`（Android `AudioPlaybackCapture`），修复部分 HyperOS 设备用 `output` 采集抖音直播时只有静音的问题
 
 ## 推荐设置（实测验证）
 
@@ -65,7 +66,7 @@ macOS 的蓝牙栈**不提供 A2DP Sink（接收端）**角色：系统设置里
   └─ AudioPlaybackCapture → 编码 (opus/aac/flac)
         │  adb (USB 或 TCP/IP 5555)
         ▼
-Mac: scrcpy --no-video --no-control --no-window
+Mac: scrcpy --no-video --no-control --no-window --audio-source=playback
         └─ 解码 → 交给默认输出设备（耳机 / 内置扬声器）
 ```
 
@@ -127,7 +128,8 @@ adb connect <手机IP>:5555          # 例如 192.168.1.20:5555
 | Performance & Levels | Mac 音量、当前输出设备（疑似蓝牙音箱时会提示）、实测网络延迟 RTT |
 | 参数行 | `Buffer` / `Bitrate` / `Codec`，传输中锁定，改动在下次 START 生效 |
 
-**数据是估算的**：`Data Received` 按运行时长 × 16 KB/s 推算，不是真实字节数；`Network Latency` 才是实测值
+**数据是估算的**：`Data Received` 按运行时长 × 16 KB/s 推算，不是真实字节数；即使采集到的是静音，数值也会增长。
+“已连接”也只表示 adb/scrcpy 链路已建立，不代表已采到非静音音频。`Network Latency` 才是实测值
 （`ping -c 2` 的平均往返时间）。
 
 ### 卡顿 / 电流声怎么调
@@ -143,6 +145,11 @@ adb connect <手机IP>:5555          # 例如 192.168.1.20:5555
 **点 START 提示"未找到手机"**
 手机不在线或无线调试没开；App 会自动重启 adb 服务重试一次，仍失败就用 USB 连一次或重新
 `adb connect`。
+
+**显示已连接、Data Received 在增长，但抖音直播无声**
+`Data Received` 是计时估算值，不能用来判断是否有声音。部分 HyperOS 设备使用 scrcpy 默认
+`--audio-source=output` 时，会把抖音直播采成全 0 PCM；本项目已改用 `--audio-source=playback`，
+直接捕获应用媒体播放，并已通过录音振幅与实际听感验证。若某个 App 明确禁止音频采集或内容受 DRM 保护，仍可能无声。
 
 **关闭程序后手机没声音**
 旧版 scrcpy 被强杀时机端的 `scrcpy-server` 会残留并继续占用音频路由。本项目已处理：启动、停止、

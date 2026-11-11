@@ -798,10 +798,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(codec, forKey: "audioCodec")
 
             // --no-window：scrcpy 即使只放音频，也会新建一个以设备名为标题的窗口，这里彻底关掉
+            // --audio-source=playback：output 在部分 HyperOS 场景（已实测抖音直播）会采到全 0 静音；
+            // playback 走 Android AudioPlaybackCapture，能正确捕获应用播放的媒体声音
             // 码率只对 opus/aac 有效，flac/raw 是无损，scrcpy 不接受 --audio-bit-rate
             // --audio-output-buffer=10：SDL 播放侧缓冲默认 5ms 偏激进易欠载破音，提到 10ms（代价仅 5ms）
             var args = ["-s", device, "--no-video", "--no-control", "--no-window",
-                        "--audio-buffer=\(bufferMs)", "--audio-output-buffer=10", "--audio-codec=\(codec)"]
+                        "--audio-source=playback", "--audio-buffer=\(bufferMs)",
+                        "--audio-output-buffer=10", "--audio-codec=\(codec)"]
             if codec == "opus" || codec == "aac" {
                 args.append("--audio-bit-rate=\(bitrateK)K")
             }
