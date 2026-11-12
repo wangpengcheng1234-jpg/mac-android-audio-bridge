@@ -979,7 +979,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateAutoBufferDisplay(_ target: Int) {
         guard bufferPopup.titleOfSelectedItem?.hasPrefix("Auto") == true else { return }
+        // 菜单项保留完整说明，收起时只显示 Auto，避免窄下拉截断成「Auto ·…」
         bufferPopup.item(at: 0)?.title = "Auto · \(target) ms"
+        bufferPopup.title = "Auto"
     }
 
     private func failSession(_ message: String, session id: UInt64) {
@@ -1196,6 +1198,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actionButton.bezelColor = NSColor(calibratedRed: 0.10, green: 0.55, blue: 0.32, alpha: 1)
         actionButton.isEnabled = true
         setSettingsEnabled(true)
+        // 会话结束后 Auto 档恢复简短显示，实际目标值仍在下次 Start 时写入
+        bufferPopup.item(at: 0)?.title = "Auto"
+        bufferPopup.title = "Auto"
     }
 }
 
