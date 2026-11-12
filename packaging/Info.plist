@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>iTrae 手机音频接收</string>
+	<string>TransAudio</string>
 	<key>CFBundleDisplayName</key>
-	<string>iTrae 手机音频接收</string>
+	<string>TransAudio</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.macaudio.phone</string>
 	<key>CFBundleExecutable</key>
@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.3</string>
+	<string>2.00</string>
 	<key>CFBundleVersion</key>
-	<string>13</string>
+	<string>20</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleDevelopmentRegion</key>

@@ -151,7 +151,18 @@ func defaultOutputDeviceName() -> String {
 
 // MARK: - 主程序
 
+@main
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.regular)
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
+    }
+
     var window: NSWindow!
 
     let deviceValue   = textLabel("—", color: C_MAGENTA, size: 12, bold: true)
@@ -181,15 +192,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let bufferPopup = NSPopUpButton()
     let bitratePopup = NSPopUpButton()
     let codecPopup = NSPopUpButton()
+    let enginePopup = NSPopUpButton()
 
     var process: Process?
+    var coreAudioPlayer: CoreAudioPlayer?
+    var sessionActive = false
+    var stopping = false
+    var sessionID: UInt64 = 0
+    var activeEngine = "Native"
     /// 当前传输使用的 adb 序列号（含 ":" 为 Wi-Fi，否则为 USB）；nil 表示未在传输
     var activeDevice: String?
-    var pollTimer: Timer?
     var uiTimer: Timer?
     var startTime: Date?
     var savedPhoneVolume: Int?
     var logHandle: FileHandle?
+    var stopCompletions: [() -> Void] = []
 
     // MARK: 建窗
 
@@ -216,7 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window = NSWindow(contentRect: rect,
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false)
-        window.title = "iTrae 手机音频接收"
+        window.title = "TransAudio"
         window.appearance = NSAppearance(named: .darkAqua)
         window.backgroundColor = C_BG
         window.center()
@@ -311,6 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let bufferOptions = ["Auto", "50 ms", "100 ms", "200 ms", "350 ms", "500 ms"]
         let bitrateOptions = ["96K", "128K", "192K", "256K", "320K"]
         let codecOptions = ["opus", "aac", "flac", "raw"]
+        let engineOptions = ["Native", "Legacy"]
 
         func savedIndex(_ key: String, _ options: [String], fallback: Int) -> Int {
             if let s = UserDefaults.standard.string(forKey: key), let i = options.firstIndex(of: s) { return i }
@@ -327,6 +345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPopup(bufferPopup, bufferOptions, savedIndex("audioBuffer", bufferOptions, fallback: 0))
         setupPopup(bitratePopup, bitrateOptions, savedIndex("audioBitrate", bitrateOptions, fallback: 1))
         setupPopup(codecPopup, codecOptions, savedIndex("audioCodec", codecOptions, fallback: 0))
+        setupPopup(enginePopup, engineOptions, savedIndex("audioEngine", engineOptions, fallback: 0))
         codecPopup.target = self
         codecPopup.action = #selector(codecChanged)
         codecChanged()
@@ -343,7 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settingsRow = NSStackView(views: [
             settingGroup("Buffer:", bufferPopup),
             settingGroup("Bitrate:", bitratePopup),
-            settingGroup("Codec:", codecPopup)
+            settingGroup("Codec:", codecPopup),
+            settingGroup("Engine:", enginePopup)
         ])
         settingsRow.orientation = .horizontal
         settingsRow.spacing = 14
@@ -628,7 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.rttValue.textColor = ms < 30 ? C_GREEN : (ms < 80 ? C_YELLOW : C_RED)
                     // 抖动 = 最坏 - 最好，直接决定缓冲要多大才不卡；越大网络越不稳
                     if let lo = minRtt, let hi = maxRtt {
-                        self.rttHint.stringValue = String(format: "抖动 %.0f ms · 建议缓冲 ≥ %.0f ms", hi - lo, hi + 20)
+                        self.rttHint.stringValue = String(format: "抖动 %.0f ms · 建议缓冲 ≥ %.0f ms", hi - lo, max(100, hi + 20))
                     } else {
                         self.rttHint.stringValue = "往返/2 ≈ 单向"
                     }
@@ -643,7 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Auto 缓冲：启动前快速 ping 手机 8 包，按「最坏 RTT + 20ms 余量」选缓冲（钳制 50~500ms）。
+    /// Auto 缓冲：启动前快速 ping 手机 8 包，按「最坏 RTT + 20ms 余量」选缓冲（Wi-Fi 钳制 100~500ms）。
     /// 缓冲要对抗的是网络抖动，最坏 RTT 就是必须囤住的水位；USB 无网络传输，直接用最小值。
     func measureAutoBuffer(device: String) -> Int {
         guard device.contains(":") else { return 50 }
@@ -663,7 +683,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let parts = out[out.index(after: eq)...].split(separator: "/")
                 if parts.count >= 3,
                    let maxRtt = Double(parts[2].trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    let chosen = min(500, max(50, Int(maxRtt.rounded()) + 20))
+                    // 实测 RTT 最高 29ms、0% 丢包时，50ms 仍频繁 underflow；
+                    // Wi-Fi Auto 至少保留 100ms，手动模式与 USB 的 50ms 不受影响
+                    let chosen = min(500, max(100, Int(maxRtt.rounded()) + 20))
                     DispatchQueue.main.async {
                         self.rttHint.stringValue = "Auto 缓冲 → \(chosen) ms（最坏 RTT \(Int(maxRtt)) ms）"
                         self.rttHint.textColor = C_CYAN
@@ -684,6 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func setSettingsEnabled(_ on: Bool) {
         bufferPopup.isEnabled = on
         codecPopup.isEnabled = on
+        enginePopup.isEnabled = on
         if on { codecChanged() } else { bitratePopup.isEnabled = false }
     }
 
@@ -709,16 +732,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func actionTapped() {
-        if let p = process, p.isRunning {
+        if sessionActive {
             stopStream()
         } else {
             startStream()
         }
     }
 
-    func startStream() {
-        if process != nil { return }
+    private func isCurrentSession(_ id: UInt64) -> Bool {
+        sessionID == id && sessionActive
+    }
 
+    func startStream() {
+        guard !sessionActive, process == nil, coreAudioPlayer == nil else { return }
         guard let dir = scrcpyDir else {
             let alert = NSAlert()
             alert.messageText = "未找到 scrcpy"
@@ -727,12 +753,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let engine = enginePopup.titleOfSelectedItem ?? "Native"
+        let executable = dir + (engine == "Native" ? "/scrcpy-coreaudio" : "/scrcpy")
+        guard FileManager.default.isExecutableFile(atPath: executable) else {
+            let alert = NSAlert()
+            alert.messageText = "未找到 \(engine) 客户端"
+            alert.informativeText = engine == "Native"
+                ? "请先运行 scripts/build-scrcpy-coreaudio.sh，或明确选择 Legacy。"
+                : "请恢复官方 scrcpy 5.0.1 客户端。"
+            alert.runModal()
+            return
+        }
+
+        let bufferChoice = bufferPopup.titleOfSelectedItem ?? "Auto"
+        let bitrateK = (bitratePopup.titleOfSelectedItem ?? "128K").replacingOccurrences(of: "K", with: "")
+        let codec = codecPopup.titleOfSelectedItem ?? "opus"
+        UserDefaults.standard.set(bufferChoice.hasPrefix("Auto") ? "Auto" : bufferChoice, forKey: "audioBuffer")
+        if bitratePopup.isEnabled {
+            UserDefaults.standard.set(bitratePopup.titleOfSelectedItem, forKey: "audioBitrate")
+        }
+        UserDefaults.standard.set(codec, forKey: "audioCodec")
+        UserDefaults.standard.set(engine, forKey: "audioEngine")
+
+        sessionID += 1
+        let id = sessionID
+        sessionActive = true
+        stopping = false
+        activeEngine = engine
         actionButton.isEnabled = false
         actionButton.title = "… CONNECTING"
         statusValue.stringValue = "CONNECTING…"
         statusValue.textColor = C_YELLOW
 
-        DispatchQueue.global().async {
+        DispatchQueue.global().async { [self] in
             var dev = self.findDevice()
             if dev == nil, !lastIP.isEmpty {
                 _ = self.runADB(["connect", "\(lastIP):5555"])
@@ -749,116 +802,196 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 dev = self.findDevice()
             }
             guard let device = dev else {
-                // 连接失败：自动诊断是「手机不在局域网」还是「手机重启导致无线调试失效」
                 let (hint, steps) = lastIP.isEmpty ? ("", "") : self.diagnoseConnection(ip: lastIP)
                 DispatchQueue.main.async {
-                    if lastIP.isEmpty {
-                        self.askForPhoneIP()
-                    } else {
-                        self.statusValue.stringValue = "NO DEVICE"
-                        self.statusValue.textColor = C_RED
-                        self.deviceValue.stringValue = hint
-                        self.transportValue.stringValue = "详见弹窗排查步骤"
-                        self.actionButton.title = "▶  START BRIDGE"
-                        self.actionButton.isEnabled = true
-                        self.showConnectionFailureAlert(hint: hint, steps: steps, ip: lastIP)
+                    guard self.isCurrentSession(id) else { return }
+                    self.stopStream {
+                        if lastIP.isEmpty {
+                            self.askForPhoneIP()
+                        } else {
+                            self.statusValue.stringValue = "NO DEVICE"
+                            self.statusValue.textColor = C_RED
+                            self.deviceValue.stringValue = hint
+                            self.transportValue.stringValue = "详见弹窗排查步骤"
+                            self.showConnectionFailureAlert(hint: hint, steps: steps, ip: lastIP)
+                        }
                     }
                 }
                 return
             }
+            guard self.isCurrentSession(id), !self.stopping else { return }
 
             let isWireless = device.contains(":")
             if isWireless { lastIP = String(device.split(separator: ":")[0]) }
             self.activeDevice = device
             DispatchQueue.main.async {
+                guard self.isCurrentSession(id) else { return }
                 self.deviceValue.stringValue = device
                 self.transportValue.stringValue = isWireless ? "Wi-Fi (adb tcpip)" : "USB (adb)"
                 self.statusValue.stringValue = "STARTING…"
             }
 
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: dir + "/scrcpy")
-
-            // 音频参数：缓冲越大越抗卡顿（延迟也越高）；码率越高越清晰；flac/raw 无损但更吃带宽
-            let bufferChoice = self.bufferPopup.titleOfSelectedItem ?? "Auto"
-            let bufferMs: String
-            if bufferChoice == "Auto" {
-                DispatchQueue.main.async { self.statusValue.stringValue = "MEASURING…" }
-                bufferMs = String(self.measureAutoBuffer(device: device))
+            let bufferMs: Int
+            if bufferChoice.hasPrefix("Auto") {
+                DispatchQueue.main.async {
+                    guard self.isCurrentSession(id), !self.stopping else { return }
+                    self.statusValue.stringValue = "MEASURING…"
+                }
+                bufferMs = self.measureAutoBuffer(device: device)
             } else {
-                bufferMs = bufferChoice.replacingOccurrences(of: " ms", with: "")
+                bufferMs = Int(bufferChoice.replacingOccurrences(of: " ms", with: "")) ?? 100
             }
-            let bitrateK = (self.bitratePopup.titleOfSelectedItem ?? "128K").replacingOccurrences(of: "K", with: "")
-            let codec = self.codecPopup.titleOfSelectedItem ?? "opus"
-            UserDefaults.standard.set(self.bufferPopup.titleOfSelectedItem, forKey: "audioBuffer")
-            // 无损编码时 Bitrate 显示的是固定值（1536K/≈800K），不要把显示值存成用户选择
-            if self.bitratePopup.isEnabled {
-                UserDefaults.standard.set(self.bitratePopup.titleOfSelectedItem, forKey: "audioBitrate")
-            }
-            UserDefaults.standard.set(codec, forKey: "audioCodec")
 
-            // --no-window：scrcpy 即使只放音频，也会新建一个以设备名为标题的窗口，这里彻底关掉
-            // --audio-source=playback：output 在部分 HyperOS 场景（已实测抖音直播）会采到全 0 静音；
-            // playback 走 Android AudioPlaybackCapture，能正确捕获应用播放的媒体声音
-            // 码率只对 opus/aac 有效，flac/raw 是无损，scrcpy 不接受 --audio-bit-rate
-            // --audio-output-buffer=10：SDL 播放侧缓冲默认 5ms 偏激进易欠载破音，提到 10ms（代价仅 5ms）
             var args = ["-s", device, "--no-video", "--no-control", "--no-window",
-                        "--audio-source=playback", "--audio-buffer=\(bufferMs)",
-                        "--audio-output-buffer=10", "--audio-codec=\(codec)"]
+                        "--audio-source=playback", "--audio-codec=\(codec)"]
+            if engine == "Legacy" {
+                args.append(contentsOf: ["--audio-buffer=\(bufferMs)", "--audio-output-buffer=10"])
+            }
             if codec == "opus" || codec == "aac" {
                 args.append("--audio-bit-rate=\(bitrateK)K")
             }
-            p.arguments = args
-            p.currentDirectoryURL = URL(fileURLWithPath: dir)
 
-            // scrcpy 自带一份 adb，会抢 5037 端口导致找不到设备；强制指定用 SDK 里的 adb
             var env = ProcessInfo.processInfo.environment
             env["ADB"] = adbPath
-            p.environment = env
+            env.removeValue(forKey: "ITRAE_PCM_SOCKET")
 
-            let logURL = URL(fileURLWithPath: "/tmp/phone-audio-scrcpy.log")
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
-            if let h = try? FileHandle(forWritingTo: logURL) {
-                try? h.truncate(atOffset: 0)
-                self.logHandle = h
-                p.standardOutput = h
-                p.standardError = h
-            } else {
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-            }
-
-            // 清掉上次可能的残留，并记下手机当前音量，停止时好恢复
+            guard self.isCurrentSession(id), !self.stopping else { return }
             self.cleanupPhoneServer()
             self.savedPhoneVolume = self.phoneMediaVolume()
 
-            do {
-                try p.run()
-            } catch {
+            if engine == "Native" {
+                var nativeSocket: String?
+                var nativeStartError: Error?
+                // 播放器和会话属性在主线程同一临界段内设置，Stop 不会漏掉启动中的 player。
+                DispatchQueue.main.sync {
+                    guard self.isCurrentSession(id), !self.stopping else { return }
+                    do {
+                        let player = try CoreAudioPlayer(targetBufferMs: bufferMs,
+                                                         autoBuffer: bufferChoice.hasPrefix("Auto"))
+                        player.onFirstPCM = { [weak self] in
+                            self?.markStreaming(session: id, engine: engine, codec: codec)
+                        }
+                        player.onFailure = { [weak self] message in
+                            self?.failSession(message, session: id)
+                        }
+                        player.onTargetBufferChange = { [weak self] target in
+                            guard let self, self.isCurrentSession(id) else { return }
+                            self.updateAutoBufferDisplay(target)
+                            self.rttHint.stringValue = "Native Auto 缓冲已调整至 \(target) ms"
+                        }
+                        nativeSocket = try player.start()
+                        self.coreAudioPlayer = player
+                    } catch {
+                        nativeStartError = error
+                    }
+                }
+                guard self.isCurrentSession(id), !self.stopping else { return }
+                if let nativeStartError {
+                    DispatchQueue.main.async {
+                        self.failSession(nativeStartError.localizedDescription, session: id)
+                    }
+                    return
+                }
+                env["ITRAE_PCM_SOCKET"] = nativeSocket
+            }
+
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: executable)
+            p.currentDirectoryURL = URL(fileURLWithPath: dir)
+            p.environment = env
+            p.terminationHandler = { [weak self] process in
                 DispatchQueue.main.async {
-                    self.statusValue.stringValue = "LAUNCH FAILED"
-                    self.statusValue.textColor = C_RED
-                    self.actionButton.title = "▶  START BRIDGE"
-                    self.actionButton.isEnabled = true
+                    guard let self, self.isCurrentSession(id), !self.stopping else { return }
+                    self.failSession("scrcpy 已退出（状态码 \(process.terminationStatus)）", session: id)
+                }
+            }
+
+            var launchError: Error?
+            // run() 与 process 赋值不可被 Stop 插入，避免遗留未被管理的 client。
+            DispatchQueue.main.sync {
+                guard self.isCurrentSession(id), !self.stopping else { return }
+                if env["ITRAE_AUDIO_DEBUG"] == "1" {
+                    args.append("--verbosity=verbose")
+                    let logURL = URL(fileURLWithPath: "/tmp/phone-audio-scrcpy.log")
+                    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+                    if let handle = try? FileHandle(forWritingTo: logURL) {
+                        try? handle.truncate(atOffset: 0)
+                        self.logHandle = handle
+                        p.standardOutput = handle
+                        p.standardError = handle
+                    }
+                }
+                if self.logHandle == nil {
+                    p.standardOutput = FileHandle.nullDevice
+                    p.standardError = FileHandle.nullDevice
+                }
+                p.arguments = args
+                do {
+                    try p.run()
+                    self.process = p
+                } catch {
+                    launchError = error
+                }
+            }
+            guard self.isCurrentSession(id), !self.stopping else { return }
+            if let launchError {
+                DispatchQueue.main.async {
+                    self.failSession("启动 scrcpy 失败：\(launchError.localizedDescription)", session: id)
                 }
                 return
             }
-            self.process = p
 
             DispatchQueue.main.async {
-                self.statusValue.stringValue = "STREAMING"
-                self.statusValue.textColor = C_GREEN
-                self.codecValue.stringValue = codec.uppercased() + " · 48 kHz · 16bit · 立体声（系统固定）"
+                guard self.isCurrentSession(id), !self.stopping else { return }
                 self.actionButton.title = "■  STOP BRIDGE"
                 self.actionButton.bezelColor = NSColor(calibratedRed: 0.62, green: 0.16, blue: 0.16, alpha: 1)
                 self.actionButton.isEnabled = true
                 self.setSettingsEnabled(false)
-                self.startTime = Date()
-                self.startTimers()
-                self.refreshVolume()
-                self.refreshRTT()
-                self.refreshOutputDevice()
+                self.updateAutoBufferDisplay(bufferMs)
+                if engine == "Legacy" {
+                    self.markStreaming(session: id, engine: engine, codec: codec)
+                } else {
+                    self.statusValue.stringValue = "WAITING PCM…"
+                    self.statusValue.textColor = C_YELLOW
+                    self.codecValue.stringValue = codec.uppercased() + " · Native CoreAudio"
+                }
             }
+        }
+    }
+
+    private func markStreaming(session id: UInt64, engine: String, codec: String) {
+        guard isCurrentSession(id), !stopping, startTime == nil else { return }
+        statusValue.stringValue = "STREAMING · \(engine.uppercased())"
+        statusValue.textColor = C_GREEN
+        codecValue.stringValue = engine == "Native"
+            ? codec.uppercased() + " · 48 kHz · Float32 · 立体声"
+            : codec.uppercased() + " · 48 kHz · 16bit · 立体声（Legacy）"
+        actionButton.title = "■  STOP BRIDGE"
+        actionButton.bezelColor = NSColor(calibratedRed: 0.62, green: 0.16, blue: 0.16, alpha: 1)
+        actionButton.isEnabled = true
+        setSettingsEnabled(false)
+        startTime = Date()
+        startTimers()
+        refreshVolume()
+        refreshRTT()
+        refreshOutputDevice()
+    }
+
+    private func updateAutoBufferDisplay(_ target: Int) {
+        guard bufferPopup.titleOfSelectedItem?.hasPrefix("Auto") == true else { return }
+        bufferPopup.item(at: 0)?.title = "Auto · \(target) ms"
+    }
+
+    private func failSession(_ message: String, session id: UInt64) {
+        guard isCurrentSession(id), !stopping else { return }
+        stopStream {
+            self.statusValue.stringValue = "ERROR"
+            self.statusValue.textColor = C_RED
+            let alert = NSAlert()
+            alert.messageText = "音频会话已停止"
+            alert.informativeText = message
+            alert.alertStyle = .warning
+            alert.runModal()
         }
     }
 
@@ -961,56 +1094,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startTimers() {
-        pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            guard let p = self.process else { return }
-            if !p.isRunning { self.resetToIdle() }
-        }
-
         uiTimer?.invalidate()
-        uiTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            guard let start = self.startTime else { return }
+        uiTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, let start = self.startTime else { return }
             let sec = Int(Date().timeIntervalSince(start))
             self.uptimeValue.stringValue = String(format: "%02d:%02d", sec / 60, sec % 60)
-            // 按 scrcpy 默认音频码率（Opus 128 kbps ≈ 16 KB/s）估算已接收量
-            let mb = Double(sec) * 16.0 / 1024.0
-            self.dataValue.stringValue = String(format: "%.2f MB", mb)
+            if self.activeEngine == "Native" {
+                let bytes = self.coreAudioPlayer?.snapshot().receivedPCMBytes ?? 0
+                self.dataValue.stringValue = String(format: "PCM %.2f MB", Double(bytes) / 1_048_576.0)
+            } else {
+                // Legacy 没有 PCM 回传，只保留原官方路径的时间估算值。
+                self.dataValue.stringValue = String(format: "≈ %.2f MB", Double(sec) * 16.0 / 1024.0)
+            }
             if sec % 3 == 0 { self.refreshVolume() }
             if sec % 5 == 0 { self.refreshRTT() }
             if sec % 8 == 0 { self.refreshOutputDevice() }
         }
     }
 
-    func stopStream() {
-        guard let p = process else { return }
+    /// 所有退出路径共用：先停 Native 播放和 socket，再停 client、手机 server 与日志。
+    func stopStream(completion: @escaping () -> Void = {}) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.stopStream(completion: completion) }
+            return
+        }
+        if stopping {
+            stopCompletions.append(completion)
+            return
+        }
+        guard sessionActive || process != nil || coreAudioPlayer != nil else {
+            completion()
+            return
+        }
+
+        stopping = true
+        stopCompletions.append(completion)
         statusValue.stringValue = "STOPPING…"
         statusValue.textColor = C_YELLOW
         actionButton.isEnabled = false
+        uiTimer?.invalidate()
+        uiTimer = nil
 
-        DispatchQueue.global().async {
-            p.terminate() // SIGTERM：scrcpy 会自己走清理流程
-            var waited = 0
-            while p.isRunning && waited < 30 {
-                usleep(100_000)
-                waited += 1
+        let client = process
+        let player = coreAudioPlayer
+        let log = logHandle
+        logHandle = nil
+
+        let stopClientAndSession = {
+            DispatchQueue.global().async {
+                if let client, client.isRunning {
+                    client.terminate()
+                    var waited = 0
+                    while client.isRunning && waited < 30 {
+                        usleep(100_000)
+                        waited += 1
+                    }
+                    if client.isRunning {
+                        kill(client.processIdentifier, SIGKILL)
+                    }
+                }
+                try? log?.close()
+
+                self.cleanupPhoneServer()
+                if let saved = self.savedPhoneVolume, self.phoneMediaVolume() == 0 {
+                    self.setPhoneMediaVolume(saved)
+                }
+                self.savedPhoneVolume = nil
+
+                DispatchQueue.main.async {
+                    self.resetToIdle()
+                    let completions = self.stopCompletions
+                    self.stopCompletions.removeAll()
+                    completions.forEach { $0() }
+                }
             }
-            if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        }
 
-            // 双保险：清掉设备端 server，手机声音立刻回来
-            self.cleanupPhoneServer()
-            if let saved = self.savedPhoneVolume, self.phoneMediaVolume() == 0 {
-                self.setPhoneMediaVolume(saved)
-            }
-            self.savedPhoneVolume = nil
-
-            DispatchQueue.main.async { self.resetToIdle() }
+        if let player {
+            player.stop(completion: stopClientAndSession)
+        } else {
+            stopClientAndSession()
         }
     }
 
     func resetToIdle() {
-        pollTimer?.invalidate(); pollTimer = nil
-        uiTimer?.invalidate(); uiTimer = nil
+        uiTimer?.invalidate()
+        uiTimer = nil
+        sessionActive = false
+        stopping = false
         process = nil
+        coreAudioPlayer = nil
         startTime = nil
         activeDevice = nil
         statusValue.stringValue = "IDLE"
@@ -1023,33 +1196,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actionButton.bezelColor = NSColor(calibratedRed: 0.10, green: 0.55, blue: 0.32, alpha: 1)
         actionButton.isEnabled = true
         setSettingsEnabled(true)
-
-        // 异常退出兜底：确保手机上不残留采集进程，声音能回来
-        if savedPhoneVolume != nil {
-            DispatchQueue.global().async {
-                self.cleanupPhoneServer()
-                self.savedPhoneVolume = nil
-            }
-        }
     }
 }
 
 extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        // 关窗口即断开：先把设备端清理干净再退出，否则手机会一直没声音
-        if let p = process, p.isRunning { p.terminate() }
-        cleanupPhoneServer()
-        if let saved = savedPhoneVolume, phoneMediaVolume() == 0 {
-            setPhoneMediaVolume(saved)
+        if sessionActive || process != nil || coreAudioPlayer != nil {
+            stopStream { NSApp.terminate(nil) }
+        } else {
+            NSApp.terminate(nil)
         }
-        savedPhoneVolume = nil
-        process = nil
-        NSApp.terminate(nil)
     }
 }
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.regular)
-app.run()

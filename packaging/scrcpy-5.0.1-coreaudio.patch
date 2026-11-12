@@ -1,0 +1,367 @@
+diff --git a/app/src/audio_player.c b/app/src/audio_player.c
+index 98a5f70..f5d3bff 100644
+--- a/app/src/audio_player.c
++++ b/app/src/audio_player.c
+@@ -1,41 +1,134 @@
+ #include "audio_player.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <libavutil/channel_layout.h>
++#include <libavutil/error.h>
++#include <libavutil/mathematics.h>
++#include <libavutil/opt.h>
++#include <libavutil/samplefmt.h>
++#include <libswresample/swresample.h>
++
+ #include "util/log.h"
+-#include "util/memory.h"
+-#include "SDL3/SDL_hints.h"
+ 
+ /** Downcast frame_sink to sc_audio_player */
+ #define DOWNCAST(SINK) container_of(SINK, struct sc_audio_player, frame_sink)
+ 
+-#define SC_SDL_SAMPLE_FMT SDL_AUDIO_F32LE
+-
+-static void SDLCALL
+-sc_audio_player_stream_callback(void *userdata, SDL_AudioStream *stream,
+-                                int additional_amount, int total_amount) {
+-    (void) total_amount;
+-
+-    struct sc_audio_player *ap = userdata;
+-
+-    size_t len = additional_amount;
+-    assert(len % ap->audioreg.sample_size == 0);
+-
+-    // The requested amount may exceed the internal aout_buffer size.
+-    // In this (unlikely) case, send the data to the stream in multiple chunks.
+-    while (len) {
+-        size_t chunk_size = MIN(ap->aout_buffer_size, len);
+-        uint32_t out_samples = chunk_size / ap->audioreg.sample_size;
+-        sc_audio_regulator_pull(&ap->audioreg, ap->aout_buffer,
+-                                out_samples);
+-
+-        assert(chunk_size <= len);
+-        len -= chunk_size;
+-        bool ok =
+-            SDL_PutAudioStreamData(stream, ap->aout_buffer, chunk_size);
+-        if (!ok) {
+-            LOGW("Audio stream error: %s", SDL_GetError());
+-            return;
++#define SC_PCM_SAMPLE_RATE 48000
++#define SC_PCM_CHANNELS 2
++#define SC_PCM_BYTES_PER_FRAME 8
++
++static void
++sc_audio_player_store_u32le(uint8_t *out, uint32_t value) {
++    out[0] = value & 0xff;
++    out[1] = (value >> 8) & 0xff;
++    out[2] = (value >> 16) & 0xff;
++    out[3] = (value >> 24) & 0xff;
++}
++
++static bool
++sc_audio_player_send_all(struct sc_audio_player *ap, const uint8_t *data,
++                         size_t size) {
++    size_t sent = 0;
++    while (sent < size) {
++#ifdef MSG_NOSIGNAL
++        int flags = MSG_NOSIGNAL;
++#else
++        int flags = 0;
++#endif
++        ssize_t w = send(ap->socket_fd, data + sent, size - sent, flags);
++        if (w < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            LOGE("PCM socket send failed: %s", strerror(errno));
++            return false;
++        }
++        if (w == 0) {
++            LOGE("PCM socket closed by receiver");
++            return false;
+         }
++        sent += (size_t) w;
++    }
++    return true;
++}
++
++static void
++sc_audio_player_release(struct sc_audio_player *ap) {
++    if (ap->socket_fd >= 0) {
++        close(ap->socket_fd);
++        ap->socket_fd = -1;
++    }
++    swr_free(&ap->swr_ctx);
++    free(ap->swr_buf);
++    ap->swr_buf = NULL;
++    ap->swr_buf_size = 0;
++}
++
++static bool
++sc_audio_player_connect(struct sc_audio_player *ap, const char *path) {
++    size_t len = strlen(path);
++    if (len == 0 || len >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
++        LOGE("Invalid PCM socket path");
++        return false;
++    }
++
++    ap->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (ap->socket_fd < 0) {
++        LOGE("Could not create PCM socket: %s", strerror(errno));
++        return false;
++    }
++    fcntl(ap->socket_fd, F_SETFD, FD_CLOEXEC);
++
++#ifdef SO_NOSIGPIPE
++    int enabled = 1;
++    if (setsockopt(ap->socket_fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
++                   sizeof(enabled))) {
++        LOGE("Could not disable PCM socket SIGPIPE: %s", strerror(errno));
++        return false;
++    }
++#endif
++
++    struct sockaddr_un address;
++    memset(&address, 0, sizeof(address));
++    address.sun_family = AF_UNIX;
++#ifdef __APPLE__
++    address.sun_len = sizeof(address);
++#endif
++    memcpy(address.sun_path, path, len + 1);
++
++    int ret;
++    do {
++        ret = connect(ap->socket_fd, (const struct sockaddr *) &address,
++                      sizeof(address));
++    } while (ret < 0 && errno == EINTR);
++    if (ret < 0) {
++        LOGE("Could not connect PCM socket: %s", strerror(errno));
++        return false;
++    }
++    return true;
++}
++
++static bool
++sc_audio_player_reserve(struct sc_audio_player *ap, size_t size) {
++    if (size <= ap->swr_buf_size) {
++        return true;
++    }
++    uint8_t *buf = realloc(ap->swr_buf, size);
++    if (!buf) {
++        LOG_OOM();
++        return false;
+     }
++    ap->swr_buf = buf;
++    ap->swr_buf_size = size;
++    return true;
+ }
+ 
+ static enum sc_sink_result
+@@ -43,7 +136,32 @@ sc_audio_player_frame_sink_push(struct sc_frame_sink *sink,
+                                 const AVFrame *frame) {
+     struct sc_audio_player *ap = DOWNCAST(sink);
+ 
+-    bool ok = sc_audio_regulator_push(&ap->audioreg, frame);
++    int input_rate = frame->sample_rate;
++    if (input_rate <= 0) {
++        LOGE("Invalid decoded PCM sample rate");
++        return SC_SINK_KO;
++    }
++
++    int64_t delay = swr_get_delay(ap->swr_ctx, input_rate);
++    int dst_samples = (int) av_rescale_rnd(delay + frame->nb_samples + 256,
++                                           SC_PCM_SAMPLE_RATE, input_rate,
++                                           AV_ROUND_UP);
++    if (dst_samples < 0 || !sc_audio_player_reserve(
++                               ap, (size_t) dst_samples * SC_PCM_BYTES_PER_FRAME)) {
++        return SC_SINK_KO;
++    }
++
++    uint8_t *out = ap->swr_buf;
++    int samples = swr_convert(ap->swr_ctx, &out, dst_samples,
++                              (const uint8_t **) frame->extended_data,
++                              frame->nb_samples);
++    if (samples < 0) {
++        LOGE("PCM conversion failed: %s", av_err2str(samples));
++        return SC_SINK_KO;
++    }
++
++    bool ok = sc_audio_player_send_all(
++        ap, ap->swr_buf, (size_t) samples * SC_PCM_BYTES_PER_FRAME);
+     return ok ? SC_SINK_OK : SC_SINK_KO;
+ }
+ 
+@@ -52,103 +170,49 @@ sc_audio_player_frame_sink_open(struct sc_frame_sink *sink,
+                                 const AVCodecContext *ctx,
+                                 const struct sc_stream_session *session) {
+     (void) session;
+-
+     struct sc_audio_player *ap = DOWNCAST(sink);
+ 
+-    assert(ctx->ch_layout.nb_channels > 0 && ctx->ch_layout.nb_channels < 256);
+-    uint8_t nb_channels = ctx->ch_layout.nb_channels;
+-
+-    assert(ctx->sample_rate > 0);
+-    assert(!av_sample_fmt_is_planar(SC_AV_SAMPLE_FMT));
+-    int out_bytes_per_sample = av_get_bytes_per_sample(SC_AV_SAMPLE_FMT);
+-    assert(out_bytes_per_sample > 0);
+-
+-    uint32_t target_buffering_samples =
+-        ap->target_buffering_delay * ctx->sample_rate / SC_TICK_FREQ;
+-
+-    size_t sample_size = nb_channels * out_bytes_per_sample;
+-    bool ok = sc_audio_regulator_init(&ap->audioreg, sample_size, ctx,
+-                                      target_buffering_samples);
+-    if (!ok) {
+-        return false;
+-    }
+-
+-    uint64_t aout_samples = ap->output_buffer_duration * ctx->sample_rate
+-                                                       / SC_TICK_FREQ;
+-    assert(aout_samples <= 0xFFFF);
+-
+-    char str[5 + 1]; // max 65535
+-    int r = snprintf(str, sizeof(str), "%" PRIu16, (uint16_t) aout_samples);
+-    assert(r >= 0 && (size_t) r < sizeof(str));
+-    (void) r;
+-    if (!SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, str)) {
+-        LOGE("Could not set audio output buffer");
+-        sc_audio_regulator_destroy(&ap->audioreg);
+-        return false;
+-    }
+-
+-    // Make the buffer at least 1024 samples long (the hint is not always
+-    // honored)
+-    uint64_t aout_buffer_samples = MAX(1024, aout_samples);
+-    ap->aout_buffer_size = aout_buffer_samples * sample_size;
+-    ap->aout_buffer = sc_allocarray(aout_buffer_samples, sample_size);
+-    if (!ap->aout_buffer) {
+-        sc_audio_regulator_destroy(&ap->audioreg);
++    const char *path = getenv("ITRAE_PCM_SOCKET");
++    if (!path || !sc_audio_player_connect(ap, path)) {
++        sc_audio_player_release(ap);
+         return false;
+     }
+ 
+-    SDL_AudioSpec spec = {
+-        .freq = ctx->sample_rate,
+-        .format = SC_SDL_SAMPLE_FMT,
+-        .channels = nb_channels,
+-    };
+-
+-    ap->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+-                                           &spec,
+-                                           sc_audio_player_stream_callback, ap);
+-    if (!ap->stream) {
+-        LOGE("Could not open audio device: %s", SDL_GetError());
+-        free(ap->aout_buffer);
+-        sc_audio_regulator_destroy(&ap->audioreg);
++    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
++    int ret = swr_alloc_set_opts2(&ap->swr_ctx, &out_layout, AV_SAMPLE_FMT_FLT,
++                                  SC_PCM_SAMPLE_RATE, &ctx->ch_layout,
++                                  ctx->sample_fmt, ctx->sample_rate, 0, NULL);
++    if (ret < 0 || swr_init(ap->swr_ctx) < 0) {
++        LOGE("Could not initialize PCM converter");
++        sc_audio_player_release(ap);
+         return false;
+     }
+ 
+-    ap->device = SDL_GetAudioStreamDevice(ap->stream);
+-    assert(ap->device);
+-
+-    ok = SDL_ResumeAudioDevice(ap->device);
+-    if (!ok) {
+-        LOGE("Could not resume audio device: %s", SDL_GetError());
+-        SDL_DestroyAudioStream(ap->stream);
+-        free(ap->aout_buffer);
+-        sc_audio_regulator_destroy(&ap->audioreg);
++    uint8_t header[16] = {'I', 'T', 'R', 'A'};
++    sc_audio_player_store_u32le(header + 4, 1);
++    sc_audio_player_store_u32le(header + 8, SC_PCM_SAMPLE_RATE);
++    sc_audio_player_store_u32le(header + 12, SC_PCM_CHANNELS);
++    if (!sc_audio_player_send_all(ap, header, sizeof(header))) {
++        sc_audio_player_release(ap);
+         return false;
+     }
+ 
++    LOGI("CoreAudio PCM sink connected: 48000 Hz Float32 stereo");
+     return true;
+ }
+ 
+ static void
+ sc_audio_player_frame_sink_close(struct sc_frame_sink *sink) {
+     struct sc_audio_player *ap = DOWNCAST(sink);
+-
+-    assert(ap->stream);
+-    assert(ap->device);
+-    SDL_PauseAudioDevice(ap->device);
+-
+-    // ap->device is owned by ap->stream
+-    SDL_DestroyAudioStream(ap->stream);
+-
+-    sc_audio_regulator_destroy(&ap->audioreg);
+-
+-    free(ap->aout_buffer);
++    sc_audio_player_release(ap);
+ }
+ 
+ void
+ sc_audio_player_init(struct sc_audio_player *ap, sc_tick target_buffering,
+                      sc_tick output_buffer_duration) {
+-    ap->target_buffering_delay = target_buffering;
+-    ap->output_buffer_duration = output_buffer_duration;
++    (void) target_buffering;
++    (void) output_buffer_duration;
++    ap->socket_fd = -1;
+ 
+     static const struct sc_frame_sink_ops ops = {
+         .open = sc_audio_player_frame_sink_open,
+diff --git a/app/src/audio_player.h b/app/src/audio_player.h
+index 786200b..888a600 100644
+--- a/app/src/audio_player.h
++++ b/app/src/audio_player.h
+@@ -3,31 +3,16 @@
+ 
+ #include "common.h"
+ 
+-#include <SDL3/SDL_audio.h>
+-
+-#include "audio_regulator.h"
+ #include "trait/frame_sink.h"
+ #include "util/tick.h"
+ 
+ struct sc_audio_player {
+     struct sc_frame_sink frame_sink;
+ 
+-    // The target buffering between the producer and the consumer. This value
+-    // is directly use for compensation.
+-    // Since audio capture and/or encoding on the device typically produce
+-    // blocks of 960 samples (20ms) or 1024 samples (~21.3ms), this target
+-    // value should be higher.
+-    sc_tick target_buffering_delay;
+-
+-    // SDL audio output buffer size
+-    sc_tick output_buffer_duration;
+-
+-    uint8_t *aout_buffer;
+-    size_t aout_buffer_size;
+-
+-    SDL_AudioStream *stream;
+-    SDL_AudioDeviceID device; // owned by the audio stream
+-    struct sc_audio_regulator audioreg;
++    int socket_fd;
++    struct SwrContext *swr_ctx;
++    uint8_t *swr_buf;
++    size_t swr_buf_size;
+ };
+ 
+ void
