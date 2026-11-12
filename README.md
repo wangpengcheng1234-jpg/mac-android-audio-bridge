@@ -3,7 +3,9 @@
 > 把 Android 手机的系统声音实时送到 Mac 播放 —— 走 ADB（Wi‑Fi 或 USB），不依赖蓝牙。
 > 单窗口 GUI，一个按钮开关，可在界面上调音频缓冲 / 码率 / 编码。
 
-![界面截图](docs/screenshot.png)
+[界面截图]
+<img width="796" height="508" alt="screenshot" src="https://github.com/user-attachments/assets/d471c413-d906-4b73-9a6d-db115b61941d" />
+
 
 ---
 
