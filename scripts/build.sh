@@ -19,10 +19,12 @@ clang -std=c11 -O3 -Wall -Wextra -Werror \
   -o "$APP_BUILD/PCMRingBuffer.o"
 
 echo "==> 编译 Swift 源码"
-swiftc -O -target arm64-apple-macos13.0 \
+swiftc -O -target arm64-apple-macos14.0 \
   -import-objc-header "$ROOT/scripts/BridgingHeader.h" \
   -o "$BUNDLE/Contents/MacOS/PhoneAudio" \
   "$ROOT/scripts/Main.swift" \
+  "$ROOT/scripts/OnboardingWindow.swift" \
+  "$ROOT/scripts/DeviceStrip.swift" \
   "$ROOT/scripts/CoreAudioPlayer.swift" \
   "$APP_BUILD/PCMRingBuffer.o"
 
