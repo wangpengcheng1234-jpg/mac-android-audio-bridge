@@ -59,6 +59,9 @@ func mono(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
 class PanelView: NSView {
     var title: String = ""
     var borderColor: NSColor = C_BORDER
+    /// 标题右侧的延伸分隔线。标题同一行右侧放有文字（如设备条的状态提示）时必须关闭，
+    /// 否则这条线会正好从文字中间穿过。
+    var showsTitleRule: Bool = true
 
     init(title: String, borderColor: NSColor = C_BORDER) {
         self.title = title
@@ -89,12 +92,14 @@ class PanelView: NSView {
             titleRect.insetBy(dx: -4, dy: 0).fill()
             title.draw(at: titleRect.origin, withAttributes: attrs)
 
-            let line = NSBezierPath()
-            line.move(to: NSPoint(x: 12 + size.width + 8, y: bounds.height - 14))
-            line.line(to: NSPoint(x: bounds.width - 12, y: bounds.height - 14))
-            borderColor.withAlphaComponent(0.45).setStroke()
-            line.lineWidth = 1
-            line.stroke()
+            if showsTitleRule {
+                let line = NSBezierPath()
+                line.move(to: NSPoint(x: 12 + size.width + 8, y: bounds.height - 14))
+                line.line(to: NSPoint(x: bounds.width - 12, y: bounds.height - 14))
+                borderColor.withAlphaComponent(0.45).setStroke()
+                line.lineWidth = 1
+                line.stroke()
+            }
         }
     }
 }
@@ -1063,9 +1068,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Auto 缓冲：启动前快速 ping 手机 8 包，按「最坏 RTT + 20ms 余量」选缓冲（Wi-Fi 钳制 100~500ms）。
-    /// 缓冲要对抗的是网络抖动，最坏 RTT 就是必须囤住的水位；USB 无网络传输，直接用最小值。
+    /// 缓冲要对抗的是网络抖动，最坏 RTT 就是必须囤住的水位；USB 无网络传输，直接给实测稳定下限。
     func measureAutoBuffer(device: String) -> Int {
-        guard device.contains(":") else { return 50 }
+        guard device.contains(":") else { return 64 }
         let ip = String(device.split(separator: ":")[0])
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/sbin/ping")
@@ -1083,8 +1088,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if parts.count >= 3,
                    let maxRtt = Double(parts[2].trimmingCharacters(in: .whitespacesAndNewlines)) {
                     // 实测 RTT 最高 29ms、0% 丢包时，50ms 仍频繁 underflow；
-                    // Wi-Fi Auto 至少保留 100ms，手动模式与 USB 的 50ms 不受影响
-                    let chosen = min(500, max(100, Int(maxRtt.rounded()) + 20))
+                    // Wi-Fi Auto 至少保留 120ms，之后由播放器自行下调到稳定值
+                    let chosen = min(500, max(120, Int(maxRtt.rounded()) + 40))
                     DispatchQueue.main.async {
                         self.rttHint.stringValue = "Auto 缓冲 → \(chosen) ms（最坏 RTT \(Int(maxRtt)) ms）"
                         self.rttHint.textColor = C_CYAN
@@ -1568,7 +1573,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard self.isCurrentSession(id), !self.stopping else { return }
                     do {
                         let player = try CoreAudioPlayer(targetBufferMs: bufferMs,
-                                                         autoBuffer: bufferChoice.hasPrefix("Auto"))
+                                                         autoBuffer: bufferChoice.hasPrefix("Auto"),
+                                                         autoFloorMs: isWireless ? 100 : 64)
                         player.onFirstPCM = { [weak self] in
                             self?.markStreaming(session: id, engine: engine, codec: codec)
                         }

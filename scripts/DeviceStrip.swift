@@ -205,6 +205,8 @@ final class DeviceStripView: PanelView {
 
     override init(title: String, borderColor: NSColor = C_GREEN) {
         super.init(title: title, borderColor: borderColor)
+        // 标题行右侧是扫描状态文字，不能再画标题分隔线
+        showsTitleRule = false
         buildSubviews()
     }
 
