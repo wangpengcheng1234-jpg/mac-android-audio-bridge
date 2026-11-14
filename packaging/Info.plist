@@ -2,33 +2,33 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleName</key>
-	<string>TransAudio</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
 	<string>TransAudio</string>
-	<key>CFBundleIdentifier</key>
-	<string>local.macaudio.phone</string>
 	<key>CFBundleExecutable</key>
 	<string>PhoneAudio</string>
 	<key>CFBundleIconFile</key>
 	<string>icon</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.macaudio.phone</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>TransAudio</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.00</string>
+	<string>2.10</string>
 	<key>CFBundleVersion</key>
-	<string>20</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
-	<key>CFBundleDevelopmentRegion</key>
-	<string>zh_CN</string>
+	<string>21</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>用于通过 Wi-Fi 连接手机并接收音频</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 </dict>
 </plist>
