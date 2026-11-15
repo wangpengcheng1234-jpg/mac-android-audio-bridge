@@ -61,14 +61,20 @@ final class CoreAudioPlayer {
 
     private let autoBuffer: Bool
     private(set) var targetBufferMs: Int
-    private let autoFloorMs: Int
-    private var learnedFloorMs: Int
+    /// 物理下限：CoreAudio 一次回调 + 一包音频的最小可播放时长，不能再低
+    private let hardFloorMs = 20
+    /// 已确认「会欠载」的下界（初始等于物理下限）
+    private var floorMs: Int = 20
+    /// 已确认「稳定播放」的最低值
+    private var bestStableMs: Int = 0
     private var stableTicks = 0
-    private var probingLower = false
+    private var probing = false
     private var probeBaseMs = 0
     private var minAvailableFrames = Int.max
     private var lastUnderflowEvents: UInt64 = 0
     private var adaptationCooldown = 0
+    /// 判定稳定所需的连续秒数
+    private let stableWindow = 60
     private var currentRatePPM: Int32 = 1_000_000
     private var debugLog: FileHandle?
     private let debugEnabled = ProcessInfo.processInfo.environment["ITRAE_AUDIO_DEBUG"] == "1"
@@ -77,11 +83,11 @@ final class CoreAudioPlayer {
     var onFailure: ((String) -> Void)?
     var onTargetBufferChange: ((Int) -> Void)?
 
-    init(targetBufferMs: Int, autoBuffer: Bool, autoFloorMs: Int = 40) throws {
+    init(targetBufferMs: Int, autoBuffer: Bool) throws {
         self.autoBuffer = autoBuffer
         self.targetBufferMs = min(500, max(20, targetBufferMs))
-        self.autoFloorMs = min(500, max(20, autoFloorMs))
-        self.learnedFloorMs = min(500, max(20, autoFloorMs))
+        self.bestStableMs = self.targetBufferMs
+        self.floorMs = hardFloorMs
         guard let ring = pcm_ring_create(Self.sampleRate) else {
             throw NSError(domain: "CoreAudioPlayer", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "无法分配 PCM 环形缓冲"])
@@ -423,42 +429,51 @@ final class CoreAudioPlayer {
             if value.state == UInt32(PCMRingStatePlaying.rawValue) {
                 minAvailableFrames = min(minAvailableFrames, value.availableFrames)
             }
+
             if underflowed {
+                // 发生欠载：当前水位不够，把当前值记为「不稳」，回到上一个已知稳定值
                 stableTicks = 0
                 minAvailableFrames = Int.max
-                if probingLower {
-                    // 下调后被抖动吃穿：退回下调前的值，并把该值定为本次会话的下限
-                    probingLower = false
+                if probing {
+                    probing = false
+                    floorMs = max(floorMs, targetBufferMs)
                     targetBufferMs = probeBaseMs
-                    learnedFloorMs = probeBaseMs
-                    pcm_ring_set_target_frames(ring, targetBufferMs * 48)
-                    adaptationCooldown = 120
-                    let target = targetBufferMs
-                    DispatchQueue.main.async { self.onTargetBufferChange?(target) }
-                    log("ADAPT restore=\(target)ms floor=\(learnedFloorMs)ms underflows=\(value.underflowEvents)")
-                } else if adaptationCooldown == 0 {
-                    // 真实欠载直接抬高水位，并把抬高后的值锁为下限，避免再次试探性下调
-                    applyAutoTarget(min(500, targetBufferMs + 8), reason: "underflow")
-                    learnedFloorMs = targetBufferMs
+                    bestStableMs = min(bestStableMs, probeBaseMs)
+                    applyTarget(probeBaseMs)
+                    adaptationCooldown = 30
+                    log("ADAPT probe-fail target=\(probeBaseMs)ms floor=\(floorMs)ms")
+                } else {
+                    let raised = min(500, targetBufferMs + 8)
+                    floorMs = max(floorMs, targetBufferMs)
+                    bestStableMs = raised
+                    targetBufferMs = raised
+                    applyTarget(raised)
                     adaptationCooldown = 60
+                    log("ADAPT raise target=\(raised)ms floor=\(floorMs)ms")
                 }
             } else {
                 stableTicks += 1
-                if stableTicks >= 120, adaptationCooldown == 0 {
-                    let floor = max(autoFloorMs, learnedFloorMs)
-                    // 只有水位长期有余量时才尝试下调，避免无谓的试探性断音
-                    let headroom = targetBufferMs * 48 * 3 / 4
-                    if targetBufferMs > floor, minAvailableFrames >= headroom {
-                        probeBaseMs = targetBufferMs
-                        probingLower = true
-                        stableTicks = 0
-                        minAvailableFrames = Int.max
-                        applyAutoTarget(max(floor, targetBufferMs - 4), reason: "probe")
-                        adaptationCooldown = 5
-                    } else {
-                        stableTicks = min(stableTicks, 120)
-                        minAvailableFrames = Int.max
+                if stableTicks >= stableWindow, adaptationCooldown == 0 {
+                    // 连续稳定一个窗口：当前值可作为新的已知稳定点
+                    bestStableMs = min(bestStableMs, targetBufferMs)
+                    probing = false
+
+                    // 余量充足且上下界之间仍有间隙时，二分下探
+                    let headroomFrames = targetBufferMs * 48 * 3 / 10
+                    let headroomOk = minAvailableFrames >= headroomFrames
+                    if bestStableMs - floorMs > 4, headroomOk {
+                        let mid = (floorMs + bestStableMs) / 2
+                        let next = max(floorMs + 4, (mid / 4) * 4)
+                        if next < targetBufferMs {
+                            probeBaseMs = targetBufferMs
+                            probing = true
+                            applyTarget(next)
+                            adaptationCooldown = 5
+                            log("ADAPT probe \(targetBufferMs)->\(next)ms floor=\(floorMs) best=\(bestStableMs)")
+                        }
                     }
+                    stableTicks = 0
+                    minAvailableFrames = Int.max
                 }
             }
         }
@@ -477,14 +492,13 @@ final class CoreAudioPlayer {
         }
     }
 
-    private func applyAutoTarget(_ ms: Int, reason: String) {
-        let clamped = min(500, max(20, ms))
+    private func applyTarget(_ ms: Int) {
+        let clamped = min(500, max(hardFloorMs, ms))
         guard clamped != targetBufferMs else { return }
         targetBufferMs = clamped
         pcm_ring_set_target_frames(ring, clamped * 48)
         let target = clamped
         DispatchQueue.main.async { self.onTargetBufferChange?(target) }
-        log("ADAPT \(reason) target=\(target)ms floor=\(learnedFloorMs)ms")
     }
 
     private func isRunning() -> Bool {

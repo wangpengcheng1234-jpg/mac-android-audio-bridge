@@ -1067,10 +1067,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Auto 缓冲：启动前快速 ping 手机 8 包，按「最坏 RTT + 20ms 余量」选缓冲（Wi-Fi 钳制 100~500ms）。
-    /// 缓冲要对抗的是网络抖动，最坏 RTT 就是必须囤住的水位；USB 无网络传输，直接给实测稳定下限。
+    /// Auto 缓冲起始值：只做粗略估计，真正的下限由播放器在播放过程中自行下探学习。
+    /// USB 无网络传输，从 40 ms 起；Wi-Fi 按 ping 最坏 RTT 估一个偏保守的起点，
+    /// 之后播放器会二分下探到当前环境能稳住的最低值，不再强制下限。
     func measureAutoBuffer(device: String) -> Int {
-        guard device.contains(":") else { return 64 }
+        guard device.contains(":") else { return 40 }
         let ip = String(device.split(separator: ":")[0])
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/sbin/ping")
@@ -1087,23 +1088,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let parts = out[out.index(after: eq)...].split(separator: "/")
                 if parts.count >= 3,
                    let maxRtt = Double(parts[2].trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    // 实测 RTT 最高 29ms、0% 丢包时，50ms 仍频繁 underflow；
-                    // Wi-Fi Auto 至少保留 120ms，之后由播放器自行下调到稳定值
-                    let chosen = min(500, max(120, Int(maxRtt.rounded()) + 40))
+                    let chosen = min(500, max(40, Int(maxRtt.rounded()) + 40))
                     DispatchQueue.main.async {
-                        self.rttHint.stringValue = "Auto 缓冲 → \(chosen) ms（最坏 RTT \(Int(maxRtt)) ms）"
+                        self.rttHint.stringValue = "Auto 起始 \(chosen) ms（最坏 RTT \(Int(maxRtt)) ms，会自动下探）"
                         self.rttHint.textColor = C_CYAN
                     }
                     return chosen
                 }
             }
         } catch {}
-        // 测量失败（手机 ICMP 被拦等）→ 取保守中间值
         DispatchQueue.main.async {
-            self.rttHint.stringValue = "Auto 测量失败 → 200 ms"
+            self.rttHint.stringValue = "Auto 测量失败 → 120 ms，会自动下探"
             self.rttHint.textColor = C_YELLOW
         }
-        return 200
+        return 120
     }
 
     /// 传输中禁用参数下拉（改动需重新 START 才生效）
@@ -1573,8 +1571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard self.isCurrentSession(id), !self.stopping else { return }
                     do {
                         let player = try CoreAudioPlayer(targetBufferMs: bufferMs,
-                                                         autoBuffer: bufferChoice.hasPrefix("Auto"),
-                                                         autoFloorMs: isWireless ? 100 : 64)
+                                                         autoBuffer: bufferChoice.hasPrefix("Auto"))
                         player.onFirstPCM = { [weak self] in
                             self?.markStreaming(session: id, engine: engine, codec: codec)
                         }
