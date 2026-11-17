@@ -38,6 +38,7 @@ void pcm_ring_reset(PCMRingBuffer *ring);
 
 void pcm_ring_set_target_frames(PCMRingBuffer *ring, size_t targetFrames);
 void pcm_ring_set_consumption_rate_ppm(PCMRingBuffer *ring, int32_t ratePPM);
+void pcm_ring_set_gain(PCMRingBuffer *ring, float value);
 void pcm_ring_request_stop(PCMRingBuffer *ring);
 
 void pcm_ring_note_received_bytes(PCMRingBuffer *ring, size_t byteCount);

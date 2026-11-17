@@ -19,6 +19,9 @@ struct PCMRingBuffer {
     _Atomic uint32_t state;
     _Atomic float gain;
     _Atomic uint32_t fadeRemaining;
+    /// 手机媒体音量对应的用户增益（0~1），渲染线程做平滑，避免调节时的拉链噪声
+    _Atomic float userGain;
+    float userGainCurrent;
 
     _Atomic uint64_t receivedPCMBytes;
     _Atomic uint64_t renderedFrames;
@@ -56,6 +59,8 @@ PCMRingBuffer *pcm_ring_create(size_t capacityFrames) {
     atomic_init(&ring->state, PCMRingStatePriming);
     atomic_init(&ring->gain, 0.0f);
     atomic_init(&ring->fadeRemaining, 0);
+    atomic_init(&ring->userGain, 1.0f);
+    ring->userGainCurrent = 1.0f;
     return ring;
 }
 
@@ -113,8 +118,20 @@ void pcm_ring_set_consumption_rate_ppm(PCMRingBuffer *ring, int32_t ratePPM) {
     atomic_store_explicit(&ring->readStep, step, memory_order_release);
 }
 
-void pcm_ring_request_stop(PCMRingBuffer *ring) {
+/// 设置用户增益（0~1，来自手机媒体音量）。只写目标值，平滑在渲染线程里做。
+void pcm_ring_set_gain(PCMRingBuffer *ring, float value) {
     if (!ring) {
+        return;
+    }
+    if (!(value >= 0.0f)) {
+        value = 0.0f;
+    } else if (value > 1.0f) {
+        value = 1.0f;
+    }
+    atomic_store_explicit(&ring->userGain, value, memory_order_relaxed);
+}
+
+void pcm_ring_request_stop(PCMRingBuffer *ring) {    if (!ring) {
         return;
     }
     uint32_t state = pcm_ring_load_state(ring);
@@ -216,6 +233,8 @@ uint32_t pcm_ring_render(PCMRingBuffer *ring, float *left, float *right,
     }
 
     float gain = atomic_load_explicit(&ring->gain, memory_order_relaxed);
+    float userGainTarget = atomic_load_explicit(&ring->userGain, memory_order_relaxed);
+    float userGain = ring->userGainCurrent;
     uint32_t fadeRemaining = atomic_load_explicit(&ring->fadeRemaining,
                                                   memory_order_relaxed);
     uint64_t step = atomic_load_explicit(&ring->readStep,
@@ -264,10 +283,14 @@ uint32_t pcm_ring_render(PCMRingBuffer *ring, float *left, float *right,
             --fadeRemaining;
         }
 
-        left[produced] = l * gain;
-        right[produced] = r * gain;
+        left[produced] = l * gain * userGain;
+        right[produced] = r * gain * userGain;
         readPosition += step;
+
+        // 约 30 ms 平滑到目标增益（48 kHz 下 1/1440）
+        userGain += (userGainTarget - userGain) * (1.0f / 1440.0f);
     }
+    ring->userGainCurrent = userGain;
 
     atomic_store_explicit(&ring->readPosition, readPosition,
                           memory_order_release);

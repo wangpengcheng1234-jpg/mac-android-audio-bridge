@@ -180,6 +180,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let volBar   = textLabel("[░░░░░░░░░░░░░░]", color: C_GREEN, size: 12, bold: true)
     let volValue = textLabel("— %", color: C_GREEN, size: 12, bold: true)
+    /// 手机媒体音量（跟随用），与 Mac 音量独立
+    let phoneVolValue = textLabel("手机 —", color: C_DIM, size: 10)
     let outValue = textLabel("检测中…", color: C_WHITE, size: 12)
     let outHint  = textLabel("Mac 音频输出", color: C_DIM, size: 11)
     let rttValue = textLabel("— ms", color: C_BLUE, size: 13, bold: true)
@@ -213,7 +215,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var uiTimer: Timer?
     var startTime: Date?
     var savedPhoneVolume: Int?
-    var logHandle: FileHandle?
+    /// 自动重连：当前会话已自动恢复次数 / 是否正在恢复（恢复期间不弹窗、不展开设备条）
+    var autoRecoverAttempts = 0
+    var isAutoRecovering = false
+    /// 手机音量跟随
+    var phoneVolTimer: Timer?
+    var volumeQueryInFlight = false
+    /// 心跳（与 RTT 探测共用 5 秒节拍）
+    var heartbeatInFlight = false
+    var heartbeatFailures = 0
+    var lastHeartbeatMs = 0
     var stopCompletions: [() -> Void] = []
     var onboardingController: OnboardingWindowController?
 
@@ -367,7 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         // —— 右面板：Performance & Levels
-        let volRow = NSStackView(views: [volBar, volValue])
+        let volRow = NSStackView(views: [volBar, volValue, phoneVolValue])
         volRow.orientation = .horizontal
         volRow.spacing = 8
         volRow.alignment = .centerY
@@ -791,7 +802,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 杀掉手机端遗留的 scrcpy 采集进程。
     /// scrcpy 被异常终止时，设备端的 server 会活着继续占用音频路由（remote_submix），
     /// 表现就是「关掉电脑上的程序后手机没声音」。
-    private func cleanupPhoneServer() {
+    private func cleanupPhoneServer(endingSession: UInt64? = nil) {
+        // 旧会话的收尾可能晚于新会话启动，此时不能杀掉新会话刚拉起的采集进程
+        if let endingSession {
+            let current: UInt64 = Thread.isMainThread ? sessionID : DispatchQueue.main.sync { self.sessionID }
+            if current != endingSession { return }
+        }
         let out = runADB(["shell", "ps", "-A", "-o", "PID,ARGS"])
         for line in out.split(separator: "\n")
             where line.contains("com.genymobile.scrcpy.Server") && line.contains("video=false") {
@@ -802,28 +818,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func refreshVolume() {
-        DispatchQueue.global().async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            p.arguments = ["-e", "output volume of (get volume settings)"]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError = FileHandle.nullDevice
-            var vol = -1
-            do {
-                try p.run(); p.waitUntilExit()
-                let d = pipe.fileHandleForReading.readDataToEndOfFile()
-                vol = Int((String(data: d, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
-            } catch { vol = -1 }
+    /// 直接读默认输出设备的音量（0~100），避免 fork osascript 带来的延迟与开销
+    func defaultOutputVolume() -> Int? {
+        var devAddr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var dev = AudioDeviceID(0)
+        var devSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &devAddr, 0, nil, &devSize, &dev) == noErr, dev != 0 else {
+            return nil
+        }
 
+        var volAddr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+                                                 mScope: kAudioObjectPropertyScopeOutput,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var volume = Float32(0)
+        var size = UInt32(MemoryLayout<Float32>.size)
+        if AudioObjectHasProperty(dev, &volAddr),
+           AudioObjectGetPropertyData(dev, &volAddr, 0, nil, &size, &volume) == noErr {
+            return Int((volume * 100).rounded())
+        }
+        // 部分设备只在左右声道上暴露音量
+        var values: [Float32] = []
+        for channel in [UInt32(1), UInt32(2)] {
+            var chAddr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+                                                    mScope: kAudioObjectPropertyScopeOutput,
+                                                    mElement: channel)
+            var v = Float32(0)
+            var s = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectHasProperty(dev, &chAddr),
+               AudioObjectGetPropertyData(dev, &chAddr, 0, nil, &s, &v) == noErr {
+                values.append(v)
+            }
+        }
+        guard !values.isEmpty else { return nil }
+        let avg = values.reduce(0, +) / Float32(values.count)
+        return Int((avg * 100).rounded())
+    }
+
+    func refreshVolume() {
+        guard let vol = defaultOutputVolume() else { return }
+        volBar.stringValue = "[\(blockBar(Double(vol)))]"
+        volValue.stringValue = "\(vol)%"
+        let color = vol >= 80 ? C_RED : C_GREEN
+        volBar.textColor = color
+        volValue.textColor = color
+    }
+
+    /// 会话期间跟随手机媒体音量：0.4 秒轮询一次，换算成软件增益（不改变 Mac 音量）
+    private func startPhoneVolumePolling() {
+        phoneVolTimer?.invalidate()
+        phoneVolTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            self?.pollPhoneVolume()
+        }
+    }
+
+    private func pollPhoneVolume() {
+        guard let device = activeDevice, !volumeQueryInFlight else { return }
+        volumeQueryInFlight = true
+        DispatchQueue.global().async {
+            let out = self.runADB(["-s", device, "shell", "cmd", "media_session",
+                                   "volume", "--stream", "3", "--get"], timeout: 3)
+            var index = -1
+            var maxIndex = -1
+            if let r = out.range(of: "volume is ") {
+                index = Int(out[r.upperBound...].prefix { $0.isNumber }) ?? -1
+            }
+            if let r = out.range(of: "in range [") {
+                let parts = out[r.upperBound...].split(separator: ".", omittingEmptySubsequences: true)
+                if let last = parts.last { maxIndex = Int(last.prefix { $0.isNumber }) ?? -1 }
+            }
             DispatchQueue.main.async {
-                guard vol >= 0 else { return }
-                self.volBar.stringValue = "[\(blockBar(Double(vol)))]"
-                self.volValue.stringValue = "\(vol)%"
-                let color = vol >= 80 ? C_RED : C_GREEN
-                self.volBar.textColor = color
-                self.volValue.textColor = color
+                self.volumeQueryInFlight = false
+                guard self.activeDevice == device, index >= 0, maxIndex > 0 else { return }
+                self.phoneVolValue.stringValue = "手机 \(index)/\(maxIndex)"
+                self.phoneVolValue.textColor = index == 0 ? C_DIM : C_GREEN
+                // Android 音乐音量近似感知曲线：振幅 ≈ (档位/最大值)²
+                let ratio = Double(index) / Double(maxIndex)
+                self.coreAudioPlayer?.setGain(index == 0 ? 0 : Float(ratio * ratio))
+            }
+        }
+    }
+
+    /// 轻量心跳：确认 adb 通道还活着，连续两次失败就交给自动重连
+    private func heartbeat() {
+        guard let device = activeDevice, !heartbeatInFlight else { return }
+        heartbeatInFlight = true
+        let session = sessionID
+        DispatchQueue.global().async {
+            let began = Date()
+            let out = self.runADB(["-s", device, "shell", "echo", "ok"], timeout: 3)
+            let ms = Int(Date().timeIntervalSince(began) * 1000)
+            let ok = out.contains("ok")
+            DispatchQueue.main.async {
+                self.heartbeatInFlight = false
+                guard self.isCurrentSession(session), self.activeDevice == device else { return }
+                guard ok else {
+                    self.heartbeatFailures += 1
+                    if self.heartbeatFailures >= 2 {
+                        self.heartbeatFailures = 0
+                        self.failSession("与手机的调试连接断开了", retryable: true, session: session)
+                    }
+                    return
+                }
+                self.heartbeatFailures = 0
+                self.lastHeartbeatMs = ms
+                // 无线时用真实音频链路（adb over TCP）的往返取代 ping 值
+                if device.contains(":") {
+                    self.rttValue.stringValue = "\(ms) ms"
+                    self.rttValue.textColor = ms > 120 ? C_RED : (ms > 60 ? C_YELLOW : C_GREEN)
+                    self.rttHint.stringValue = "实际音频链路往返"
+                    self.rttHint.textColor = C_DIM
+                }
             }
         }
     }
@@ -1401,8 +1508,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionID == id && sessionActive
     }
 
-    func startStream(preferredDevice: String? = nil, needsWirelessConnect: Bool = false) {
+    func startStream(preferredDevice: String? = nil, needsWirelessConnect: Bool = false, isAutoRecovery: Bool = false) {
         guard !sessionActive, process == nil, coreAudioPlayer == nil else { return }
+        // 用户手动开始/切换设备时清零自动重连计数；自动恢复时保留计数
+        if !isAutoRecovery {
+            autoRecoverAttempts = 0
+            isAutoRecovering = false
+        }
         guard let dir = scrcpyDir else {
             let alert = NSAlert()
             alert.messageText = "找不到 scrcpy 组件"
@@ -1446,6 +1558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actionButton.title = "… CONNECTING"
         statusValue.stringValue = "CONNECTING…"
         statusValue.textColor = C_YELLOW
+        startPhoneVolumePolling()
 
         DispatchQueue.global().async { [self] in
             var dev: String?
@@ -1576,7 +1689,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             self?.markStreaming(session: id, engine: engine, codec: codec)
                         }
                         player.onFailure = { [weak self] message in
-                            self?.failSession(message, session: id)
+                            // 采集端断开属于可恢复故障，交给自动重连；输出设备断开则不可恢复
+                            self?.failSession(message, retryable: Self.isRecoverableAudioError(message), session: id)
                         }
                         player.onTargetBufferChange = { [weak self] target in
                             guard let self, self.isCurrentSession(id) else { return }
@@ -1599,14 +1713,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 env["ITRAE_PCM_SOCKET"] = nativeSocket
             }
 
+            // 启动客户端；始终保留 stderr 尾部，把“状态码 0/1”翻译成可读原因。
             let p = Process()
             p.executableURL = URL(fileURLWithPath: executable)
             p.currentDirectoryURL = URL(fileURLWithPath: dir)
             p.environment = env
-            p.terminationHandler = { [weak self] process in
+            p.arguments = args
+
+            let pipe = Pipe()
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = pipe
+            let outLock = NSLock()
+            var tailLines: [String] = []
+            pipe.fileHandleForReading.readabilityHandler = { fh in
+                let data = fh.availableData
+                guard !data.isEmpty, let s = String(data: data, encoding: .utf8) else { return }
+                outLock.lock()
+                tailLines.append(contentsOf: s.split(separator: "\n").map(String.init))
+                if tailLines.count > 80 { tailLines.removeFirst(tailLines.count - 80) }
+                outLock.unlock()
+            }
+            p.terminationHandler = { [weak self] proc in
+                // 等管道把最后几行读完再归类
+                usleep(150_000)
+                pipe.fileHandleForReading.readabilityHandler = nil
+                outLock.lock()
+                let lines = tailLines
+                outLock.unlock()
                 DispatchQueue.main.async {
                     guard let self, self.isCurrentSession(id), !self.stopping else { return }
-                    self.failSession("scrcpy 意外退出（状态码 \(process.terminationStatus)）。请检查手机连接后重试。", session: id)
+                    let verdict = self.classifyClientExit(status: proc.terminationStatus, tail: lines)
+                    self.writeDiagnosticLog(lines: lines, status: proc.terminationStatus)
+                    self.failSession(verdict.message, retryable: verdict.retryable, session: id)
                 }
             }
 
@@ -1614,22 +1752,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // run() 与 process 赋值不可被 Stop 插入，避免遗留未被管理的 client。
             DispatchQueue.main.sync {
                 guard self.isCurrentSession(id), !self.stopping else { return }
-                if env["ITRAE_AUDIO_DEBUG"] == "1" {
-                    args.append("--verbosity=verbose")
-                    let logURL = URL(fileURLWithPath: "/tmp/phone-audio-scrcpy.log")
-                    FileManager.default.createFile(atPath: logURL.path, contents: nil)
-                    if let handle = try? FileHandle(forWritingTo: logURL) {
-                        try? handle.truncate(atOffset: 0)
-                        self.logHandle = handle
-                        p.standardOutput = handle
-                        p.standardError = handle
-                    }
-                }
-                if self.logHandle == nil {
-                    p.standardOutput = FileHandle.nullDevice
-                    p.standardError = FileHandle.nullDevice
-                }
-                p.arguments = args
                 do {
                     try p.run()
                     self.process = p
@@ -1637,8 +1759,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     launchError = error
                 }
             }
-            guard self.isCurrentSession(id), !self.stopping else { return }
+            guard self.isCurrentSession(id), !self.stopping else {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                return
+            }
             if let launchError {
+                pipe.fileHandleForReading.readabilityHandler = nil
                 DispatchQueue.main.async {
                     self.failSession("无法启动 scrcpy：\(launchError.localizedDescription)", session: id)
                 }
@@ -1663,10 +1789,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 归类客户端退出原因，决定是否值得自动重连（自动重连仍失败时才弹提示）
+    private func classifyClientExit(status: Int32, tail: [String]) -> (retryable: Bool, message: String) {
+        let text = tail.joined(separator: "\n").lowercased()
+        if text.contains("audio playback capture") || text.contains("not supported")
+            || text.contains("could not start audio") || text.contains("audiorecord") {
+            return (true, "手机拒绝了系统声音采集。当前前台应用可能禁止被录制（部分游戏、视频、银行类 App 会这样）。请退出该应用或回到桌面后重新开始。")
+        }
+        if text.contains("could not find adb device") || text.contains("server connection failed")
+            || text.contains("device offline") || text.contains("unauthorized")
+            || text.contains("connection reset") || text.contains("broken pipe") {
+            return (true, "与手机的调试连接断开了。已自动重连；若仍失败，请重新插拔数据线，或确认手机与 Mac 仍在同一 Wi-Fi。")
+        }
+        if status == 0 {
+            return (true, "手机端采集进程意外结束，已自动重试。")
+        }
+        return (false, "scrcpy 退出（状态码 \(status)）。请检查手机连接后重试。")
+    }
+
+    /// 记录最近一次异常的事件与客户端输出，便于事后定位（保留最近 512 KB）
+    private func writeDiagnosticLog(lines: [String], status: Int32) {
+        let dir = NSHomeDirectory() + "/Library/Logs/TransAudio"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "/transaudio.log"
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var text = "\n[\(fmt.string(from: Date()))] session=\(sessionID) device=\(activeDevice ?? "-") exit=\(status)\n"
+        text += lines.suffix(40).joined(separator: "\n") + "\n"
+        guard let data = text.data(using: .utf8) else { return }
+        let fm = FileManager.default
+        if let size = (try? fm.attributesOfItem(atPath: path))?[.size] as? Int, size > 512 * 1024 {
+            try? fm.removeItem(atPath: path)
+        }
+        if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+            handle.seekToEndOfFile()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+
     private func markStreaming(session id: UInt64, engine: String, codec: String) {
         guard isCurrentSession(id), !stopping, startTime == nil else { return }
+        // 已经恢复出声，清零自动重连计数
+        autoRecoverAttempts = 0
+        isAutoRecovering = false
         statusValue.stringValue = "STREAMING · \(engine.uppercased())"
         statusValue.textColor = C_GREEN
+        transportValue.stringValue = activeDevice?.contains(":") == true ? "Wi-Fi (adb tcpip)" : "USB (adb)"
+        transportValue.textColor = C_DIM
         codecValue.stringValue = engine == "Native"
             ? codec.uppercased() + " · 48 kHz · Float32 · 立体声"
             : codec.uppercased() + " · 48 kHz · 16bit · 立体声（Legacy）"
@@ -1688,18 +1860,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bufferPopup.title = "Auto"
     }
 
-    private func failSession(_ message: String, session id: UInt64) {
+    /// 播放器侧的故障是否属于可恢复（采集端断开 / 短暂无数据），可自动重连
+    static func isRecoverableAudioError(_ message: String) -> Bool {
+        let text = message
+        if text.contains("输出设备已断开") { return false }
+        return text.contains("已结束音频会话") || text.contains("未发送 PCM")
+            || text.contains("等待 scrcpy PCM 超时") || text.contains("连接已断开")
+            || text.contains("读取 PCM") || text.contains("接收 PCM")
+            || text.contains("接受 PCM") || text.contains("listener")
+    }
+
+    private func failSession(_ message: String, retryable: Bool = false, session id: UInt64) {
         guard isCurrentSession(id), !stopping else { return }
+
+        // 采集端断开、adb 掉线等瞬时故障：不弹窗，整段会话自动重连（最多 2 次）
+        if retryable, !isTerminating, let device = activeDevice, autoRecoverAttempts < 2 {
+            autoRecoverAttempts += 1
+            isAutoRecovering = true
+            let round = autoRecoverAttempts
+            statusValue.stringValue = "RECONNECTING \(round)/2…"
+            statusValue.textColor = C_YELLOW
+            transportValue.stringValue = "\(Self.shortHint(message)) · 正在自动重试"
+            transportValue.textColor = C_YELLOW
+            stopStream { [weak self] in
+                guard let self else { return }
+                // Stop 过程会把状态改成 STOPPING，这里再恢复为重连提示
+                self.statusValue.stringValue = "RECONNECTING \(round)/2…"
+                self.statusValue.textColor = C_YELLOW
+                self.transportValue.stringValue = "\(Self.shortHint(message)) · 正在自动重试"
+                self.transportValue.textColor = C_YELLOW
+                self.startStream(preferredDevice: device,
+                                 needsWirelessConnect: device.contains(":"),
+                                 isAutoRecovery: true)
+            }
+            return
+        }
+
+        autoRecoverAttempts = 0
+        isAutoRecovering = false
+        // 始终收不到 PCM 时，最常见的原因就是前台应用禁止被录制，给出对应建议
+        let finalText = (message.contains("PCM 超时") || message.contains("未发送 PCM"))
+            ? "手机没有送出任何音频数据。当前前台应用可能禁止被录制（部分游戏、视频、银行类 App 会这样）。请退出该应用或回到桌面后重新开始。"
+            : message
         stopStream {
             self.statusValue.stringValue = "ERROR"
             self.statusValue.textColor = C_RED
             let alert = NSAlert()
             alert.messageText = "音频会话已中断"
-            alert.informativeText = message
+            alert.informativeText = finalText
             alert.alertStyle = .warning
             alert.addButton(withTitle: "好")
             alert.runModal()
         }
+    }
+
+    /// 重连时显示的一句话原因
+    private static func shortHint(_ message: String) -> String {
+        if message.contains("采集") || message.contains("录制") { return "手机拒绝采集系统声音" }
+        if message.contains("调试连接") { return "与手机的调试连接断开" }
+        if message.contains("输出设备") { return "Mac 输出设备已断开" }
+        return "音频流中断"
     }
 
     /// 连不上手机时自动诊断，返回（一句话原因，排查步骤）。
@@ -1821,8 +2041,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // Legacy 没有 PCM 回传，只保留原官方路径的时间估算值。
                 self.dataValue.stringValue = String(format: "≈ %.2f MB", Double(sec) * 16.0 / 1024.0)
             }
-            if sec % 3 == 0 { self.refreshVolume() }
-            if sec % 5 == 0 { self.refreshRTT() }
+            self.refreshVolume()
+            if sec % 5 == 0 {
+                if self.sessionActive { self.heartbeat() } else { self.refreshRTT() }
+            }
             if sec % 8 == 0 { self.refreshOutputDevice() }
         }
     }
@@ -1852,8 +2074,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let client = process
         let player = coreAudioPlayer
-        let log = logHandle
-        logHandle = nil
+        // 记录本次要收尾的会话号：旧会话的异步清理不能杀掉新会话刚拉起的采集进程
+        let endedSession = sessionID
 
         let stopClientAndSession = {
             DispatchQueue.global().async {
@@ -1868,9 +2090,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         kill(client.processIdentifier, SIGKILL)
                     }
                 }
-                try? log?.close()
 
-                self.cleanupPhoneServer()
+                self.cleanupPhoneServer(endingSession: endedSession)
                 if let saved = self.savedPhoneVolume, self.phoneMediaVolume() == 0 {
                     self.setPhoneMediaVolume(saved)
                 }
@@ -1895,24 +2116,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func resetToIdle() {
         uiTimer?.invalidate()
         uiTimer = nil
+        phoneVolTimer?.invalidate()
+        phoneVolTimer = nil
+        volumeQueryInFlight = false
+        heartbeatFailures = 0
+        // 会话结束：增益回到 1，手机音量行复位
+        coreAudioPlayer?.setGain(1)
+        phoneVolValue.stringValue = "手机 —"
+        phoneVolValue.textColor = C_DIM
         sessionActive = false
         stopping = false
         process = nil
         coreAudioPlayer = nil
         startTime = nil
         activeDevice = nil
-        statusValue.stringValue = "IDLE"
-        statusValue.textColor = C_YELLOW
-        transportValue.stringValue = "手机需与 Mac 同一 Wi-Fi"
-        transportValue.textColor = C_DIM
+        // 自动恢复期间保持 RECONNECTING 提示，不闪回 IDLE
+        if isAutoRecovering {
+            statusValue.stringValue = "RECONNECTING…"
+            statusValue.textColor = C_YELLOW
+        } else {
+            statusValue.stringValue = "IDLE"
+            statusValue.textColor = C_YELLOW
+            transportValue.stringValue = "手机需与 Mac 同一 Wi-Fi"
+            transportValue.textColor = C_DIM
+        }
         uptimeValue.stringValue = "00:00"
         dataValue.stringValue = "0.0 MB"
         setSettingsEnabled(true)
         // 会话结束后 Auto 档恢复简短显示，实际目标值仍在下次 Start 时写入
         bufferPopup.item(at: 0)?.title = "Auto"
         bufferPopup.title = "Auto"
-        // 回到空闲态：重新展开设备条供重新选择（退出 App 时不做）
-        if !isTerminating {
+        // 回到空闲态：重新展开设备条供重新选择（退出 App 与自动恢复时不做）
+        if !isTerminating && !isAutoRecovering {
             expandDeviceStrip()
         }
     }

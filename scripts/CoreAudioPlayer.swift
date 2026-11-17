@@ -76,6 +76,11 @@ final class CoreAudioPlayer {
     /// 判定稳定所需的连续秒数
     private let stableWindow = 60
     private var currentRatePPM: Int32 = 1_000_000
+    /// 水位慢速积分修正（消除稳态偏差，减少周期性欠载）
+    private var waterLevelBiasPPM: Int32 = 0
+    /// 为了 128 帧低延迟缓冲而临时改动的设备缓冲原值
+    private var previousDeviceBufferFrames: UInt32?
+    private var deviceForBufferRestore: AudioDeviceID?
     private var debugLog: FileHandle?
     private let debugEnabled = ProcessInfo.processInfo.environment["ITRAE_AUDIO_DEBUG"] == "1"
 
@@ -163,6 +168,8 @@ final class CoreAudioPlayer {
                 throw NSError(domain: "CoreAudioPlayer", code: Int(status),
                               userInfo: [NSLocalizedDescriptionKey: "无法绑定当前 Mac 输出设备（\(status)）"])
             }
+            // 先把设备缓冲压到 128 帧再启动，省 4~8 ms 输出延迟
+            tuneDeviceBuffer(deviceID)
             engine.prepare()
             try engine.start()
             startControlTimer()
@@ -176,13 +183,18 @@ final class CoreAudioPlayer {
             running = false
             lifecycleLock.unlock()
             engine.stop()
+            restoreDeviceBuffer()
             closeDescriptors()
             throw error
         }
     }
 
-    func snapshot() -> CoreAudioSnapshot {
-        CoreAudioSnapshot(pcm_ring_snapshot(ring))
+    /// 跟随手机媒体音量的软件增益（0~1），不改变 Mac 音量
+    func setGain(_ value: Float) {
+        pcm_ring_set_gain(ring, value)
+    }
+
+    func snapshot() -> CoreAudioSnapshot {        CoreAudioSnapshot(pcm_ring_snapshot(ring))
     }
 
     func stop(completion: @escaping () -> Void = {}) {
@@ -206,6 +218,7 @@ final class CoreAudioPlayer {
         controlTimer?.cancel()
         controlQueue.asyncAfter(deadline: .now() + 0.012) {
             self.engine.stop()
+            self.restoreDeviceBuffer()
             self.closeDescriptors()
             self.log("STOP \(self.snapshotDescription())")
             self.logLock.lock()
@@ -411,7 +424,7 @@ final class CoreAudioPlayer {
 
     private func controlTick() {
         guard isRunning() else { return }
-        if !firstPCMReceived && Date().timeIntervalSince(startedAt) > 15 {
+        if !firstPCMReceived && Date().timeIntervalSince(startedAt) > 10 {
             reportFailure("等待 scrcpy PCM 超时")
             return
         }
@@ -481,10 +494,18 @@ final class CoreAudioPlayer {
         var desiredRate: Int32 = 1_000_000
         if value.state == UInt32(PCMRingStatePlaying.rawValue) {
             let errorMs = Int32((value.availableFrames - value.targetFrames) / 48)
+            // 慢速积分：把稳态水位偏差拉回目标中点，抵消两端时钟的长期漂移
+            waterLevelBiasPPM += max(-40, min(40, errorMs * 4))
+            waterLevelBiasPPM = max(-1_000, min(1_000, waterLevelBiasPPM))
+            // 快速比例项：偏差较大时快速追赶
             if abs(errorMs) > 10 {
                 desiredRate += min(5_000, max(-5_000, errorMs * 50))
             }
+            desiredRate += waterLevelBiasPPM
+        } else {
+            waterLevelBiasPPM = 0
         }
+        desiredRate = min(1_010_000, max(990_000, desiredRate))
         currentRatePPM += (desiredRate - currentRatePPM) / 4
         pcm_ring_set_consumption_rate_ppm(ring, currentRatePPM)
         if debugEnabled {
@@ -499,6 +520,46 @@ final class CoreAudioPlayer {
         pcm_ring_set_target_frames(ring, clamped * 48)
         let target = clamped
         DispatchQueue.main.async { self.onTargetBufferChange?(target) }
+    }
+
+    /// 输出设备缓冲压到 128 帧（48 kHz 下约 2.7 ms），会话结束恢复原值。
+    /// 只影响本机 CoreAudio 输出延迟，不改变系统音量与采样率。
+    private func tuneDeviceBuffer(_ device: AudioDeviceID) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var current: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &current) == noErr,
+              current > 128 else { return }
+
+        var want: UInt32 = 128
+        guard AudioObjectSetPropertyData(device, &addr, 0, nil, size, &want) == noErr else { return }
+
+        var applied: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &applied) == noErr,
+              applied < current else { return }
+        previousDeviceBufferFrames = current
+        deviceForBufferRestore = device
+        log("DEVICE buffer \(current)->\(applied) frames")
+    }
+
+    /// 恢复会话开始前的设备缓冲，避免影响其他 App 的输出
+    private func restoreDeviceBuffer() {
+        guard let previous = previousDeviceBufferFrames, let device = deviceForBufferRestore else { return }
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var want = previous
+        let size = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectSetPropertyData(device, &addr, 0, nil, size, &want) == noErr {
+            log("DEVICE buffer restored \(previous) frames")
+        }
+        previousDeviceBufferFrames = nil
+        deviceForBufferRestore = nil
     }
 
     private func isRunning() -> Bool {
