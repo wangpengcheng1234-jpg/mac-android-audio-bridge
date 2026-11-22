@@ -2,6 +2,8 @@ import Cocoa
 import CoreAudio
 import Network
 import IOKit
+import IOKit.pwr_mgt
+import IOKit.ps
 
 /// scrcpy 目录查找顺序：用户设置 → App 内置 Resources/scrcpy → ~/scrcpy → ~/Downloads
 func findScrcpyDir() -> String? {
@@ -218,6 +220,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 自动重连：当前会话已自动恢复次数 / 是否正在恢复（恢复期间不弹窗、不展开设备条）
     var autoRecoverAttempts = 0
     var isAutoRecovering = false
+    /// 断联且找不到设备时进入的「暂停等待」态：不弹模态窗，主按钮变为「重试」
+    var isPausedOffline = false
     /// 手机音量跟随
     var phoneVolTimer: Timer?
     var volumeQueryInFlight = false
@@ -225,6 +229,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var heartbeatInFlight = false
     var heartbeatFailures = 0
     var lastHeartbeatMs = 0
+    /// 音频流探针：上一次观测到的 PCM 字节数 / 时间 / 最近一次 adb RTT 采样
+    var lastPCMBytes: UInt64 = 0
+    var lastPCMAt = Date.distantPast
+    var lastRTTSampleAt = Date.distantPast
     var stopCompletions: [() -> Void] = []
     var onboardingController: OnboardingWindowController?
 
@@ -232,8 +240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let deviceStrip = DeviceStripView(title: " 选择设备 ")
     var deviceStripHeight: NSLayoutConstraint?
     /// 设备条展开 / 收起时的窗口高度
-    let windowExpandedHeight: CGFloat = 596
-    let windowCollapsedHeight: CGFloat = 504
+    let windowExpandedHeight: CGFloat = 618
+    let windowCollapsedHeight: CGFloat = 526
     let stripExpandedHeight: CGFloat = 92
     var isDeviceStripVisible = true
     /// 本次选中的设备（用于自动连接）
@@ -253,10 +261,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastConnectNoRoute = false
     /// App 正在退出（退出时不再展开设备条/做动画）
     var isTerminating = false
+    /// 充电+桥接时阻止空闲休眠的 IOPM 断言 ID（0 表示无断言）
+    private var noSleepAssertionID: IOPMAssertionID = 0
+    /// 电源状态变化监听
+    private var powerSourceObserver: NSObjectProtocol?
 
     // MARK: 建窗
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 最先安装崩溃日志处理器（预打开崩溃文件 fd，保证崩溃时能写出调用栈）
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        CrashLogger.install(version: ver)
+
         buildMenu()
         buildWindow()
         refreshOutputDevice()
@@ -269,6 +285,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 上一次若异常退出，手机上可能留着 scrcpy 采集进程（会让手机一直没声音），启动时先清掉
         DispatchQueue.global().async { self.cleanupPhoneServer() }
 
+        // 充电时不休眠：监听电源状态变化
+        self.startPowerSourceMonitoring()
+
         // 首次启动显示新手引导（延迟到下一个 runloop，确保 App 已完全激活、主窗口就绪）
         if !UserDefaults.standard.bool(forKey: "onboardingCompleted") {
             DispatchQueue.main.async { [weak self] in
@@ -278,6 +297,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if noSleepAssertionID != 0 {
+            IOPMAssertionRelease(noSleepAssertionID)
+            noSleepAssertionID = 0
+        }
         adbServerProcess?.terminate()
     }
 
@@ -300,6 +323,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         helpMenuItem.submenu = helpMenu
         helpMenu.addItem(withTitle: "新手引导", action: #selector(showOnboarding), keyEquivalent: "?")
         helpMenu.addItem(withTitle: "查看 GitHub", action: #selector(openGitHub), keyEquivalent: "")
+        helpMenu.addItem(NSMenuItem.separator())
+        helpMenu.addItem(withTitle: "崩溃日志分析…", action: #selector(showCrashAnalysis), keyEquivalent: "")
     }
 
     @objc func showOnboarding() {
@@ -319,6 +344,167 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: 崩溃日志分析窗口
+
+    @objc func showCrashAnalysis() {
+        let analysis = CrashLogger.analyze()
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                           backing: .buffered, defer: false)
+        win.title = "崩溃日志分析"
+        win.center()
+
+        let root = NSView()
+        root.wantsLayer = true
+        root.layer?.backgroundColor = C_BG.cgColor
+
+        // 汇总标签
+        let summary = textLabel(
+            analysis.total == 0
+                ? "✓ 暂无崩溃记录"
+                : "共 \(analysis.total) 次崩溃，归为 \(analysis.groups.count) 类",
+            color: analysis.total == 0 ? C_GREEN : C_YELLOW, size: 13, bold: true)
+        summary.translatesAutoresizingMaskIntoConstraints = false
+
+        // 详情文本
+        let tv = NSTextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.font = mono(11)
+        tv.textColor = C_WHITE
+        tv.backgroundColor = .clear
+        tv.string = formatCrashAnalysis(analysis)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.documentView = tv
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        // 按钮
+        let revealBtn = NSButton(title: "在 Finder 中显示", target: nil, action: nil)
+        revealBtn.bezelStyle = .rounded
+        revealBtn.target = self
+        revealBtn.action = #selector(revealCrashLogs)
+        let clearBtn = NSButton(title: "清空全部", target: nil, action: nil)
+        clearBtn.bezelStyle = .rounded
+        clearBtn.target = self
+        clearBtn.action = #selector(clearCrashLogs)
+        let btnRow = NSStackView(views: [revealBtn, clearBtn, NSView()])
+        btnRow.orientation = .horizontal
+        btnRow.spacing = 10
+        btnRow.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(summary)
+        root.addSubview(scroll)
+        root.addSubview(btnRow)
+        NSLayoutConstraint.activate([
+            summary.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            summary.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            summary.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+
+            scroll.topAnchor.constraint(equalTo: summary.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+
+            btnRow.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 10),
+            btnRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            btnRow.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            btnRow.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14),
+            btnRow.heightAnchor.constraint(equalToConstant: 28),
+        ])
+
+        win.contentView = root
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func formatCrashAnalysis(_ a: CrashAnalysis) -> String {
+        guard a.total > 0 else { return "暂无崩溃记录。" }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var out = ""
+        for (i, g) in a.groups.enumerated() {
+            out += "[\(i + 1)] \(g.key)\n"
+            out += "    次数: \(g.count)   最近: \(fmt.string(from: g.latest))   版本: \(g.sample.version)\n"
+            out += "    调用栈:\n"
+            for (j, sym) in g.sample.symbols.prefix(12).enumerated() {
+                out += "      \(j). \(sym)\n"
+            }
+            out += "\n"
+        }
+        return out
+    }
+
+    @objc func revealCrashLogs() {
+        CrashLogger.revealInFinder()
+    }
+
+    @objc func clearCrashLogs() {
+        let alert = NSAlert()
+        alert.messageText = "确认清空全部崩溃日志？"
+        alert.informativeText = "此操作不可撤销。"
+        alert.addButton(withTitle: "清空")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            CrashLogger.clearAll()
+        }
+    }
+
+    // MARK: 充电时不休眠（IOPMAssertion + IOPS）
+
+    /// 是否处于交流电（充电）状态
+    private func isOnACPower() -> Bool {
+        // IOPS 的 Copy 函数返回 +1 的 CF 对象。
+        // 若用 takeRetainedValue + 桥接到 Swift Array/Dictionary，
+        // 桥接会 retain 元素，而 CF 对象释放时也会 release 元素 → 过度释放崩溃。
+        // 改用 takeUnretainedValue（不转移所有权，+1 交给 autorelease pool 平衡）。
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return false }
+        guard let list = IOPSCopyPowerSourcesList(info)?.takeUnretainedValue() as? [Any] else { return false }
+        for ps in list {
+            let psRef = ps as CFTypeRef
+            if let desc = IOPSGetPowerSourceDescription(info, psRef)?.takeUnretainedValue() as? [String: Any],
+               let state = desc[kIOPSPowerSourceStateKey as String] as? String {
+                if state == kIOPSACPowerValue as String { return true }
+            }
+        }
+        return false
+    }
+
+    /// 充电中 + 音频桥接运行中 + 用户开启 → 阻止系统空闲休眠；否则释放断言
+    private func updateSleepAssertion() {
+        let enabled = UserDefaults.standard.bool(forKey: "noSleepWhenCharging")
+        let shouldHold = enabled && sessionActive && isOnACPower()
+
+        if shouldHold, noSleepAssertionID == 0 {
+            let reason = "TransAudio 音频桥接中（充电时不休眠）" as CFString
+            let ret = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypeNoIdleSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                reason,
+                &noSleepAssertionID)
+            if ret == kIOReturnSuccess {
+                appendDiagnostic("已阻止空闲休眠（充电 + 桥接中）")
+            } else {
+                noSleepAssertionID = 0
+            }
+        } else if !shouldHold, noSleepAssertionID != 0 {
+            IOPMAssertionRelease(noSleepAssertionID)
+            noSleepAssertionID = 0
+            appendDiagnostic("已解除空闲休眠阻止")
+        }
+    }
+
+    /// 监听电源状态变化（插/拔电源），实时更新断言
+    private func startPowerSourceMonitoring() {
+        let center = NotificationCenter.default
+        powerSourceObserver = center.addObserver(
+            forName: NSNotification.Name(kIOPSTimeRemainingNotificationKey as String),
+            object: nil, queue: .main) { [weak self] _ in
+            self?.updateSleepAssertion()
+        }
+    }
+
     func panelContent(_ rows: [NSView]) -> NSStackView {
         let stack = NSStackView(views: rows)
         stack.orientation = .vertical
@@ -328,7 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func buildWindow() {
-        let rect = NSRect(x: 0, y: 0, width: 660, height: 596)
+        let rect = NSRect(x: 0, y: 0, width: 660, height: 618)
         window = NSWindow(contentRect: rect,
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false)
@@ -366,6 +552,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyRow("Uptime:        ", uptimeValue),
             keyRow("Data Received: ", dataValue)
         ]
+        // 限制 value 标签的水平压缩阻力：文本过长时截断（…）而非撑大窗口
+        for v in [deviceValue, statusValue, transportValue, codecValue, uptimeValue, dataValue] {
+            v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
         let leftPanel = PanelView(title: " System Info ", borderColor: C_BORDER)
         let leftInner = panelContent(leftRows)
         leftInner.translatesAutoresizingMaskIntoConstraints = false
@@ -469,6 +659,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsRow.alignment = .centerY
         settingsRow.translatesAutoresizingMaskIntoConstraints = false
 
+        // —— 充电时不休眠（仅在桥接运行中生效）
+        let noSleepBtn = NSButton(checkboxWithTitle: "充电中桥接时阻止 Mac 休眠", target: self, action: #selector(noSleepToggled))
+        noSleepBtn.font = .systemFont(ofSize: 11)
+        noSleepBtn.contentTintColor = C_DIM
+        noSleepBtn.state = UserDefaults.standard.bool(forKey: "noSleepWhenCharging") ? .on : .off
+        noSleepBtn.translatesAutoresizingMaskIntoConstraints = false
+
         // —— 设备选择条
         deviceStrip.translatesAutoresizingMaskIntoConstraints = false
         deviceStrip.onSelect = { [weak self] dev in self?.handleDeviceSelect(dev) }
@@ -503,6 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         root.addSubview(header)
         root.addSubview(panelsRow)
         root.addSubview(settingsRow)
+        root.addSubview(noSleepBtn)
         root.addSubview(deviceStrip)
         root.addSubview(actionButton)
         root.addSubview(footer)
@@ -525,7 +723,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
             settingsRow.heightAnchor.constraint(equalToConstant: 24),
 
-            deviceStrip.topAnchor.constraint(equalTo: settingsRow.bottomAnchor, constant: 12),
+            noSleepBtn.topAnchor.constraint(equalTo: settingsRow.bottomAnchor, constant: 8),
+            noSleepBtn.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            noSleepBtn.heightAnchor.constraint(equalToConstant: 18),
+
+            deviceStrip.topAnchor.constraint(equalTo: noSleepBtn.bottomAnchor, constant: 8),
             deviceStrip.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
             deviceStrip.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
 
@@ -869,7 +1071,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 会话期间跟随手机媒体音量：0.4 秒轮询一次，换算成软件增益（不改变 Mac 音量）
     private func startPhoneVolumePolling() {
         phoneVolTimer?.invalidate()
-        phoneVolTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+        // 3 秒一次即可：音量是用户手动动作，而 adbd 的 shell 请求是串行处理的，
+        // 每次 `cmd media_session` 要 fork 一个 app_process（100~200ms），
+        // 0.4 秒一轮会把 adbd 占满，导致心跳排队超时、把正常音频流误判成断联。
+        phoneVolTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.pollPhoneVolume()
         }
     }
@@ -901,22 +1106,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 轻量心跳：确认 adb 通道还活着，连续两次失败就交给自动重连
+    /// 心跳：以「音频流是否仍在到达 PCM」作为主信号。
+    ///
+    /// 为什么不再每次都跑 `adb shell`：
+    /// adbd 的 ShellService 是串行处理 shell 请求的，而音量跟随等功能也在占用它，
+    /// 单次 `adb shell echo ok` 实测 130~200ms，排队时可达数秒。用它当心跳会把
+    /// 正常音频流误判成断联（实测 4 次断联全部由此触发）。PCM 字节数由 C 层原子
+    /// 计数，读取零开销、零额外进程，是唯一准确的链路存活信号。
+    /// adb shell 仅作为「PCM 静默后的兜底探测」和「低频 RTT 采样」使用。
     private func heartbeat() {
         guard let device = activeDevice, !heartbeatInFlight else { return }
-        heartbeatInFlight = true
         let session = sessionID
+
+        // 主路径：最近 3 秒内有 PCM 到达 → 链路健康，完全不需要碰 adb
+        let pcmAlive = activeEngine == "Native" && Date().timeIntervalSince(lastPCMAt) <= 3
+        if pcmAlive {
+            heartbeatFailures = 0
+            // 低频采样一次 RTT 用于界面显示（30 秒一次，避免给 adbd 添负载）
+            if Date().timeIntervalSince(lastRTTSampleAt) >= 30 {
+                lastRTTSampleAt = Date()
+                probeADB(device: device, session: session, canFail: false)
+            }
+            return
+        }
+
+        // 兜底：PCM 静默（或 Legacy 引擎无 PCM 回传）→ 用 adb 探测
+        probeADB(device: device, session: session, canFail: true)
+    }
+
+    /// 执行一次 adb 存活探测。canFail=false 时只用于采样，失败不触发重连。
+    private func probeADB(device: String, session: UInt64, canFail: Bool) {
+        heartbeatInFlight = true
         DispatchQueue.global().async {
             let began = Date()
-            let out = self.runADB(["-s", device, "shell", "echo", "ok"], timeout: 3)
+            let out = self.runADB(["-s", device, "shell", "echo", "ok"], timeout: 6)
             let ms = Int(Date().timeIntervalSince(began) * 1000)
             let ok = out.contains("ok")
             DispatchQueue.main.async {
                 self.heartbeatInFlight = false
                 guard self.isCurrentSession(session), self.activeDevice == device else { return }
                 guard ok else {
+                    guard canFail else { return }
                     self.heartbeatFailures += 1
-                    if self.heartbeatFailures >= 2 {
+                    self.appendDiagnostic("心跳失败 rtt=\(ms)ms 连续失败=\(self.heartbeatFailures)（PCM 已静默 \(Int(Date().timeIntervalSince(self.lastPCMAt)))s）")
+                    // 连续 3 次失败才判定断联：单次 adb 卡顿不足以代表链路已断
+                    if self.heartbeatFailures >= 3 {
                         self.heartbeatFailures = 0
                         self.failSession("与手机的调试连接断开了", retryable: true, session: session)
                     }
@@ -924,12 +1158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.heartbeatFailures = 0
                 self.lastHeartbeatMs = ms
-                // 无线时用真实音频链路（adb over TCP）的往返取代 ping 值
-                if device.contains(":") {
-                    self.rttValue.stringValue = "\(ms) ms"
-                    self.rttValue.textColor = ms > 120 ? C_RED : (ms > 60 ? C_YELLOW : C_GREEN)
-                    self.rttHint.stringValue = "实际音频链路往返"
-                    self.rttHint.textColor = C_DIM
+                self.lastRTTSampleAt = Date()
+                // adb shell 的固有开销就有 130~200ms，阈值放到 400ms 才有意义
+                if ms > 400 {
+                    self.appendDiagnostic("adb 探测高延迟 rtt=\(ms)ms")
                 }
             }
         }
@@ -1182,7 +1414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let ip = String(device.split(separator: ":")[0])
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/sbin/ping")
-        p.arguments = ["-c", "8", "-i", "0.2", "-q", ip]
+        p.arguments = ["-c", "10", "-i", "0.2", ip]
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
@@ -1190,18 +1422,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try p.run()
             p.waitUntilExit()
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            if let r = out.range(of: "round-trip"),
-               let eq = out[r.upperBound...].firstIndex(of: "=") {
-                let parts = out[out.index(after: eq)...].split(separator: "/")
-                if parts.count >= 3,
-                   let maxRtt = Double(parts[2].trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    let chosen = min(500, max(40, Int(maxRtt.rounded()) + 40))
-                    DispatchQueue.main.async {
-                        self.rttHint.stringValue = "Auto 起始 \(chosen) ms（最坏 RTT \(Int(maxRtt)) ms，会自动下探）"
-                        self.rttHint.textColor = C_CYAN
-                    }
-                    return chosen
+            // 逐包解析 time=xx ms
+            var samples: [Double] = []
+            for line in out.split(separator: "\n") {
+                guard let r = line.range(of: "time=") else { continue }
+                let token = line[r.upperBound...].prefix { $0.isNumber || $0 == "." }
+                if let v = Double(token) { samples.append(v) }
+            }
+            if samples.count >= 2 {
+                samples.sort()
+                let maxRtt = samples[samples.count - 1]
+                // 用「次大值」而不是最大值：启动瞬间手机要 fork scrcpy / 执行 adb 命令，
+                // 偶尔会出现一个 100ms+ 的孤立尖峰，用最大值会把缓冲起始值直接顶高一倍
+                // （实测 164ms vs 真实 58ms）。丢掉单个最坏样本仍能覆盖真实抖动。
+                let robust = samples[samples.count - 2]
+                let chosen = min(500, max(40, Int(robust.rounded()) + 40))
+                self.appendDiagnostic("Auto 缓冲测量 max=\(Int(maxRtt))ms 次大=\(Int(robust))ms 起始=\(chosen)ms")
+                DispatchQueue.main.async {
+                    self.rttHint.stringValue = "Auto 起始 \(chosen) ms（抖动 \(Int(robust)) ms，会自动下探）"
+                    self.rttHint.textColor = C_CYAN
                 }
+                return chosen
             }
         } catch {}
         DispatchQueue.main.async {
@@ -1499,9 +1740,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func actionTapped() {
         if sessionActive {
             stopStream()
+        } else if isPausedOffline {
+            // 暂停态点「重试」：重新走一遍发现 + 连接流程
+            isPausedOffline = false
+            actionButton.isEnabled = false
+            actionButton.title = "… SEARCHING"
+            statusValue.stringValue = "SEARCHING…"
+            statusValue.textColor = C_CYAN
+            transportValue.stringValue = "正在重新扫描局域网…"
+            transportValue.toolTip = nil
+            transportValue.textColor = C_DIM
+            startStream()
         } else {
             startStream()
         }
+    }
+
+    /// 进入「暂停等待」态：保留排查原因，把主按钮变成可点的「重试」。
+    /// 不使用模态弹窗，避免阻塞事件循环后界面卡在 connecting。
+    private func enterPausedOffline(hint: String, steps: String) {
+        isPausedOffline = true
+        statusValue.stringValue = "PAUSED · 手机不在局域网"
+        statusValue.textColor = C_YELLOW
+        deviceValue.stringValue = hint.isEmpty ? "未找到手机" : hint
+        // 只显示短提示，避免长文本撑大窗口；完整排查步骤放到 tooltip 悬停查看
+        transportValue.stringValue = hint.isEmpty
+            ? "请确认手机与 Mac 在同一 Wi-Fi · 点 ↻ 重试"
+            : "\(hint) · 点 ↻ 重试"
+        transportValue.toolTip = steps.isEmpty ? nil : steps
+        transportValue.textColor = C_DIM
+        actionButton.title = "↻ 重试"
+        actionButton.bezelColor = NSColor(calibratedRed: 0.10, green: 0.55, blue: 0.32, alpha: 1)
+        actionButton.isEnabled = true
+        appendDiagnostic("进入暂停等待态：\(hint)，等待用户重试")
+    }
+
+    @objc func noSleepToggled(_ sender: NSButton) {
+        let on = sender.state == .on
+        UserDefaults.standard.set(on, forKey: "noSleepWhenCharging")
+        updateSleepAssertion()
     }
 
     private func isCurrentSession(_ id: UInt64) -> Bool {
@@ -1510,6 +1787,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startStream(preferredDevice: String? = nil, needsWirelessConnect: Bool = false, isAutoRecovery: Bool = false) {
         guard !sessionActive, process == nil, coreAudioPlayer == nil else { return }
+        isPausedOffline = false
+        // 清理暂停态可能遗留的排查步骤 tooltip
+        transportValue.toolTip = nil
         // 用户手动开始/切换设备时清零自动重连计数；自动恢复时保留计数
         if !isAutoRecovery {
             autoRecoverAttempts = 0
@@ -1579,10 +1859,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if !self.adbDeviceSerials().contains(pref) {
                         let out = self.runADB(["connect", pref], timeout: 10)
                         self.lastConnectNoRoute = out.contains("No route to host")
+                        self.appendDiagnostic("adb connect \(pref) → \(out.split(separator: "\n").first.map(String.init) ?? out)")
                         usleep(900_000)
                     }
                 }
-                dev = self.adbDeviceSerials().contains(pref) ? pref : self.findDevice()
+                dev = self.adbDeviceSerials().contains(pref) ? pref : nil
+
+                // 无线设备可能换了 IP（DHCP 重新分配 / 手机重连 Wi-Fi）：
+                // 先按原 IP 再连一次，仍不通就重新扫描局域网，而不是直接放弃
+                if dev == nil, pref.contains(":") {
+                    let out = self.runADB(["connect", pref], timeout: 6)
+                    self.lastConnectNoRoute = out.contains("No route to host")
+                    usleep(600_000)
+                    if self.adbDeviceSerials().contains(pref) {
+                        dev = pref
+                    } else {
+                        self.appendDiagnostic("重连失败：\(pref) 不可达，开始重新扫描局域网")
+                        DispatchQueue.main.async {
+                            guard self.isCurrentSession(id), !self.stopping else { return }
+                            self.statusValue.stringValue = "SEARCHING…"
+                            self.statusValue.textColor = C_CYAN
+                        }
+                        if let found = self.autoFindWirelessDevice() {
+                            dev = found
+                            lastIP = String(found.split(separator: ":")[0])
+                        }
+                    }
+                }
             }
 
             // 未指定设备时的历史兜底流程（手动 IP / 热点自动发现）
@@ -1621,17 +1924,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             guard let device = dev else {
                 let (hint, steps) = lastIP.isEmpty ? ("", "") : self.diagnoseConnection(ip: lastIP)
+                self.appendDiagnostic("找不到可用设备，诊断：\(hint)")
                 DispatchQueue.main.async {
                     guard self.isCurrentSession(id) else { return }
+                    // 必须先退出自动重连态：否则 resetToIdle 会认为「仍在重连」，
+                    // 既保留 RECONNECTING 文案，也不展开设备条，界面会永久卡在 connecting。
+                    self.isAutoRecovering = false
+                    self.autoRecoverAttempts = 0
                     self.stopStream {
-                        // resetToIdle 已重新展开设备条；仅有历史 IP 时才弹排查窗
-                        if !lastIP.isEmpty {
-                            self.statusValue.stringValue = "NO DEVICE"
-                            self.statusValue.textColor = C_RED
-                            self.deviceValue.stringValue = hint
-                            self.transportValue.stringValue = "详见排查步骤"
-                            self.showConnectionFailureAlert(hint: hint, steps: steps, ip: lastIP)
-                        }
+                        guard !lastIP.isEmpty else { return }
+                        self.enterPausedOffline(hint: hint, steps: steps)
                     }
                 }
                 return
@@ -1641,6 +1943,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let isWireless = device.contains(":")
             if isWireless { lastIP = String(device.split(separator: ":")[0]) }
             self.activeDevice = device
+            self.appendDiagnostic("会话开始 device=\(device) transport=\(isWireless ? "WiFi" : "USB") engine=\(engine) codec=\(codec) buffer=\(bufferChoice) bitrate=\(bitrateK)K")
             DispatchQueue.main.async {
                 guard self.isCurrentSession(id) else { return }
                 self.deviceValue.stringValue = device
@@ -1687,6 +1990,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                          autoBuffer: bufferChoice.hasPrefix("Auto"))
                         player.onFirstPCM = { [weak self] in
                             self?.markStreaming(session: id, engine: engine, codec: codec)
+                        }
+                        player.onEngineEvent = { [weak self] message in
+                            guard let self, self.isCurrentSession(id) else { return }
+                            self.appendDiagnostic(message)
+                            self.refreshOutputDevice()
                         }
                         player.onFailure = { [weak self] message in
                             // 采集端断开属于可恢复故障，交给自动重连；输出设备断开则不可恢复
@@ -1807,6 +2115,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (false, "scrcpy 退出（状态码 \(status)）。请检查手机连接后重试。")
     }
 
+    /// 追加一条诊断日志（不含客户端输出），用于记录重连、心跳等非进程退出类故障
+    func appendDiagnostic(_ text: String) {
+        let dir = NSHomeDirectory() + "/Library/Logs/TransAudio"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "/transaudio.log"
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "[\(fmt.string(from: Date()))] session=\(sessionID) device=\(activeDevice ?? "-") \(text)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let fm = FileManager.default
+        if let size = (try? fm.attributesOfItem(atPath: path))?[.size] as? Int, size > 512 * 1024 {
+            try? fm.removeItem(atPath: path)
+        }
+        if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+            handle.seekToEndOfFile()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+
     /// 记录最近一次异常的事件与客户端输出，便于事后定位（保留最近 512 KB）
     private func writeDiagnosticLog(lines: [String], status: Int32) {
         let dir = NSHomeDirectory() + "/Library/Logs/TransAudio"
@@ -1832,9 +2162,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func markStreaming(session id: UInt64, engine: String, codec: String) {
         guard isCurrentSession(id), !stopping, startTime == nil else { return }
+        let wasRecovery = isAutoRecovering
+        if wasRecovery {
+            self.appendDiagnostic("自动重连成功 device=\(activeDevice ?? "-")")
+        }
+        // 桥接已出声：若用户开启且在充电，阻止空闲休眠
+        self.updateSleepAssertion()
         // 已经恢复出声，清零自动重连计数
         autoRecoverAttempts = 0
         isAutoRecovering = false
+        // 音频流已确认开始，重置 PCM 探针基线，避免首个心跳误判静默
+        heartbeatFailures = 0
+        lastPCMBytes = coreAudioPlayer?.snapshot().receivedPCMBytes ?? 0
+        lastPCMAt = Date()
         statusValue.stringValue = "STREAMING · \(engine.uppercased())"
         statusValue.textColor = C_GREEN
         transportValue.stringValue = activeDevice?.contains(":") == true ? "Wi-Fi (adb tcpip)" : "USB (adb)"
@@ -1872,6 +2212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func failSession(_ message: String, retryable: Bool = false, session id: UInt64) {
         guard isCurrentSession(id), !stopping else { return }
+        appendDiagnostic("故障：\(message)（可恢复=\(retryable)，已重试=\(autoRecoverAttempts) 次）")
 
         // 采集端断开、adb 掉线等瞬时故障：不弹窗，整段会话自动重连（最多 2 次）
         if retryable, !isTerminating, let device = activeDevice, autoRecoverAttempts < 2 {
@@ -1892,6 +2233,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.startStream(preferredDevice: device,
                                  needsWirelessConnect: device.contains(":"),
                                  isAutoRecovery: true)
+                // 兜底：若重连没有真正启动（设备找不到等原因提前返回），不要让界面永远停在重连中
+                DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in
+                    guard let self, self.autoRecoverAttempts > 0,
+                          !self.sessionActive, !self.stopping, !self.isTerminating else { return }
+                    self.appendDiagnostic("重连未启动采集，继续下一轮")
+                    self.failSession("重连未能启动音频采集", retryable: true, session: self.sessionID)
+                }
             }
             return
         }
@@ -1986,48 +2334,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return ok
     }
 
-    /// 连接失败弹窗：给出诊断结果与排查步骤，并允许直接重填 IP
-    func showConnectionFailureAlert(hint: String, steps: String, ip: String) {
-        let alert = NSAlert()
-        alert.messageText = "无法连接到 \(ip)"
-        alert.informativeText = steps
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "好")
-        alert.addButton(withTitle: "重新输入 IP 地址")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertSecondButtonReturn {
-            self.askForPhoneIP()
-        }
-    }
-
-    /// 首次使用（没有 USB 设备、也没记过 IP）时，让用户填手机 IP
-    func askForPhoneIP() {
-        let alert = NSAlert()
-        alert.messageText = "输入手机的 IP 地址"
-        alert.informativeText = "手机与 Mac 需要连接到同一个 Wi-Fi。也可以通过 USB 数据线连接后直接开始。"
-        alert.addButton(withTitle: "好")
-        alert.addButton(withTitle: "取消")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        field.placeholderString = "192.168.1.20"
-        alert.accessoryView = field
-        NSApp.activate(ignoringOtherApps: true)
-
-        let resp = alert.runModal()
-
-        statusValue.stringValue = "IDLE"
-        statusValue.textColor = C_DIM
-        actionButton.title = "▶  START BRIDGE"
-        actionButton.isEnabled = true
-
-        if resp == .alertFirstButtonReturn {
-            let ip = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !ip.isEmpty {
-                lastIP = ip
-                startStream()
-            }
-        }
-    }
-
     func startTimers() {
         uiTimer?.invalidate()
         uiTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -2037,13 +2343,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if self.activeEngine == "Native" {
                 let bytes = self.coreAudioPlayer?.snapshot().receivedPCMBytes ?? 0
                 self.dataValue.stringValue = String(format: "PCM %.2f MB", Double(bytes) / 1_048_576.0)
+                // 记录 PCM 是否仍在增长：这是心跳判断链路存活的主信号（零额外开销）
+                if bytes > self.lastPCMBytes {
+                    self.lastPCMBytes = bytes
+                    self.lastPCMAt = Date()
+                }
             } else {
                 // Legacy 没有 PCM 回传，只保留原官方路径的时间估算值。
                 self.dataValue.stringValue = String(format: "≈ %.2f MB", Double(sec) * 16.0 / 1024.0)
             }
             self.refreshVolume()
             if sec % 5 == 0 {
-                if self.sessionActive { self.heartbeat() } else { self.refreshRTT() }
+                // 界面显示始终用 ICMP（真实网络往返 ~7ms）。
+                // 心跳用的是 adb shell，含手机端 fork 开销 130~200ms，
+                // 把它显示出来会让人误以为音频延迟变高了，所以只在会话中做健康检查。
+                self.refreshRTT()
+                if self.sessionActive { self.heartbeat() }
             }
             if sec % 8 == 0 { self.refreshOutputDevice() }
         }
@@ -2066,6 +2381,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         stopping = true
         stopCompletions.append(completion)
+        if !isAutoRecovering {
+            self.appendDiagnostic("会话停止（用户操作）")
+        }
         statusValue.stringValue = "STOPPING…"
         statusValue.textColor = C_YELLOW
         actionButton.isEnabled = false
@@ -2120,12 +2438,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         phoneVolTimer = nil
         volumeQueryInFlight = false
         heartbeatFailures = 0
+        lastPCMBytes = 0
+        lastPCMAt = Date.distantPast
+        lastRTTSampleAt = Date.distantPast
         // 会话结束：增益回到 1，手机音量行复位
         coreAudioPlayer?.setGain(1)
         phoneVolValue.stringValue = "手机 —"
         phoneVolValue.textColor = C_DIM
         sessionActive = false
         stopping = false
+        // 会话结束，释放空闲休眠阻止断言
+        self.updateSleepAssertion()
         process = nil
         coreAudioPlayer = nil
         startTime = nil
@@ -2138,6 +2461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusValue.stringValue = "IDLE"
             statusValue.textColor = C_YELLOW
             transportValue.stringValue = "手机需与 Mac 同一 Wi-Fi"
+            transportValue.toolTip = nil
             transportValue.textColor = C_DIM
         }
         uptimeValue.stringValue = "00:00"

@@ -85,6 +85,11 @@ final class CoreAudioPlayer {
     private let debugEnabled = ProcessInfo.processInfo.environment["ITRAE_AUDIO_DEBUG"] == "1"
 
     var onFirstPCM: (() -> Void)?
+    /// 引擎事件回调（输出设备切换、引擎被系统停止等），用于写入诊断日志
+    var onEngineEvent: ((String) -> Void)?
+    /// 设备变更通知 / 默认输出设备监听
+    private var configObserver: NSObjectProtocol?
+    private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
     var onFailure: ((String) -> Void)?
     var onTargetBufferChange: ((Int) -> Void)?
 
@@ -173,6 +178,7 @@ final class CoreAudioPlayer {
             engine.prepare()
             try engine.start()
             startControlTimer()
+            observeOutputDeviceChanges()
             Thread.detachNewThread { [weak self] in
                 self?.acceptAndRead()
             }
@@ -192,6 +198,95 @@ final class CoreAudioPlayer {
     /// 跟随手机媒体音量的软件增益（0~1），不改变 Mac 音量
     func setGain(_ value: Float) {
         pcm_ring_set_gain(ring, value)
+    }
+
+    /// 监听输出设备变化。
+    ///
+    /// 两个必须处理的场景（不处理就会「明明在推流却没声音」）：
+    /// 1. 系统默认输出设备变了（插拔耳机、接上蓝牙）→ AVAudioEngine 自身**会停止**，
+    ///    并发出 AVAudioEngineConfigurationChange；不重启就永久静音。
+    /// 2. 当前绑定的设备被移除 → 引擎同样停止。
+    private func observeOutputDeviceChanges() {
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            self?.handleOutputDeviceChange(reason: "AVAudioEngineConfigurationChange")
+        }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.handleOutputDeviceChange(reason: "默认输出设备变更")
+        }
+        defaultDeviceListenerBlock = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, block
+        )
+    }
+
+    private func handleOutputDeviceChange(reason: String) {
+        guard running, !stopping else { return }
+        let snapshotDeviceID = selectedDeviceID
+        // 设备切换瞬间 HAL 还没稳定，稍等一下再重绑
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.rebindToDefaultOutput(reason: reason, previousDevice: snapshotDeviceID)
+        }
+    }
+
+    /// 把输出单元重新绑到当前系统默认输出设备并重启引擎
+    private func rebindToDefaultOutput(reason: String, previousDevice: AudioDeviceID) {
+        guard running, !stopping else { return }
+        guard let newID = try? Self.defaultOutputDevice(), newID != 0 else {
+            onEngineEvent?("输出设备切换失败：读不到默认输出设备")
+            return
+        }
+        let oldName = Self.deviceName(previousDevice)
+        let newName = Self.deviceName(newID)
+        let wasRunning = engine.isRunning
+
+        // 换设备前先把旧设备的缓冲大小还原，避免把它一直留在 128 帧
+        if newID != previousDevice { restoreDeviceBuffer() }
+
+        if !wasRunning { engine.stop() }
+        selectedDeviceID = newID
+        var deviceID = newID
+        guard let au = engine.outputNode.audioUnit else {
+            onEngineEvent?("输出设备切换失败：拿不到 output unit")
+            return
+        }
+        let st = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                     kAudioUnitScope_Global, 0,
+                                     &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard st == noErr else {
+            onEngineEvent?("输出设备切换失败：绑定 \(newName) 返回 \(st)")
+            return
+        }
+        tuneDeviceBuffer(newID)
+        engine.prepare()
+        do {
+            try engine.start()
+            onEngineEvent?("输出设备已切换 → \(newName)（原 \(oldName)，\(reason)，引擎重启\(wasRunning ? "" : "（此前已停止）")）")
+        } catch {
+            onEngineEvent?("输出设备切换后引擎重启失败：\(error.localizedDescription)")
+        }
+    }
+
+    private static func deviceName(_ id: AudioDeviceID) -> String {
+        guard id != 0 else { return "未知" }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let st = withUnsafeMutablePointer(to: &name) {
+            AudioObjectGetPropertyData(id, &address, 0, nil, &size, $0)
+        }
+        return st == noErr ? (name as String) : "未知"
     }
 
     func snapshot() -> CoreAudioSnapshot {        CoreAudioSnapshot(pcm_ring_snapshot(ring))
@@ -216,6 +311,21 @@ final class CoreAudioPlayer {
 
         pcm_ring_request_stop(ring)
         controlTimer?.cancel()
+        if let observer = configObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configObserver = nil
+        }
+        if let block = defaultDeviceListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main, block
+            )
+            defaultDeviceListenerBlock = nil
+        }
         controlQueue.asyncAfter(deadline: .now() + 0.012) {
             self.engine.stop()
             self.restoreDeviceBuffer()
@@ -430,6 +540,17 @@ final class CoreAudioPlayer {
         }
         if !Self.deviceIsAlive(selectedDeviceID) {
             reportFailure("Mac 输出设备已断开，音频会话已停止")
+            return
+        }
+        // 看门狗：设备还在但引擎已经被系统停掉（切耳机、系统设置变化、睡眠唤醒）。
+        // 这种情况下 scrcpy 还在推流、界面也显示正常，但实际一点声音都没有。
+        if !engine.isRunning {
+            log("WATCHDOG engine stopped, rebind")
+            onEngineEvent?("检测到音频引擎已停止（仍在推流），正在重绑输出设备")
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.rebindToDefaultOutput(reason: "引擎已停止·看门狗", previousDevice: self.selectedDeviceID)
+            }
             return
         }
 

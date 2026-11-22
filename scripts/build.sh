@@ -21,8 +21,9 @@ clang -std=c11 -O3 -Wall -Wextra -Werror \
 echo "==> 编译 Swift 源码"
 swiftc -O -target arm64-apple-macos14.0 \
   -import-objc-header "$ROOT/scripts/BridgingHeader.h" \
-  -o "$BUNDLE/Contents/MacOS/PhoneAudio" \
+  -o "$BUNDLE/Contents/MacOS/TransAudio" \
   "$ROOT/scripts/Main.swift" \
+  "$ROOT/scripts/CrashLogger.swift" \
   "$ROOT/scripts/OnboardingWindow.swift" \
   "$ROOT/scripts/DeviceStrip.swift" \
   "$ROOT/scripts/CoreAudioPlayer.swift" \
