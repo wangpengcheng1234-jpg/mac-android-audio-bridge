@@ -225,6 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 手机音量跟随
     var phoneVolTimer: Timer?
     var volumeQueryInFlight = false
+    /// 连续读不到手机音量时的计数：用于兜底恢复满增益，避免默认增益 0 导致永久无声
+    var volumeQueryFailures = 0
     /// 心跳（与 RTT 探测共用 5 秒节拍）
     var heartbeatInFlight = false
     var heartbeatFailures = 0
@@ -848,15 +850,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if adbDeviceSerials().contains(target) { return ip }
 
         _ = runADB(["-s", usbSerial, "tcpip", "5555"], timeout: 6)
-        usleep(1_500_000)
-        _ = runADB(["connect", target], timeout: 6)
-        usleep(900_000)
-        if adbDeviceSerials().contains(target) { return ip }
-        // adbd 切换模式时 USB 侧会短暂掉线，稍等再重试一次
-        usleep(900_000)
-        _ = runADB(["connect", target], timeout: 6)
-        usleep(900_000)
-        return adbDeviceSerials().contains(target) ? ip : nil
+        // adbd 切到 TCP 模式会重启并短暂掉线。原先固定等 1.5 s 经常不够，
+        // 首次 connect 直接被拒（Connection refused），于是无线桥接永远开不起来。
+        // 改为轮询：每 0.8 s 试一次，最多约 8 秒，一旦连上立即返回。
+        for _ in 0..<10 {
+            usleep(800_000)
+            if adbDeviceSerials().contains(target) { return ip }
+            _ = runADB(["connect", target], timeout: 4)
+        }
+        return nil
     }
 
     /// mDNS 发现：Android 11+ 的无线调试会广播 _adb-tls-connect._tcp。
@@ -989,33 +991,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    /// 读手机媒体音量（STREAM_MUSIC）
-    private func phoneMediaVolume() -> Int? {
-        let out = runADB(["shell", "cmd", "media_session", "volume", "--stream", "3", "--get"])
+    /// 读手机媒体音量（STREAM_MUSIC）。多设备连接时必须指定 serial，否则 adb 会报
+    /// 「more than one device/emulator」而读不到值。
+    private func phoneMediaVolume(serial: String? = nil) -> Int? {
+        var args: [String] = []
+        if let serial { args += ["-s", serial] }
+        args += ["shell", "cmd", "media_session", "volume", "--stream", "3", "--get"]
+        let out = runADB(args)
         guard let r = out.range(of: "volume is ") else { return nil }
         let digits = out[r.upperBound...].prefix { $0.isNumber }
         return Int(digits)
     }
 
-    private func setPhoneMediaVolume(_ v: Int) {
-        _ = runADB(["shell", "cmd", "media_session", "volume", "--stream", "3", "--set", "\(v)"])
+    private func setPhoneMediaVolume(_ v: Int, serial: String? = nil) {
+        var args: [String] = []
+        if let serial { args += ["-s", serial] }
+        args += ["shell", "cmd", "media_session", "volume", "--stream", "3", "--set", "\(v)"]
+        _ = runADB(args)
     }
 
     /// 杀掉手机端遗留的 scrcpy 采集进程。
     /// scrcpy 被异常终止时，设备端的 server 会活着继续占用音频路由（remote_submix），
     /// 表现就是「关掉电脑上的程序后手机没声音」。
-    private func cleanupPhoneServer(endingSession: UInt64? = nil) {
+    ///
+    /// 注意：多台设备同时连接（如手机 + 平板）时，`adb shell` 不带 `-s` 会直接返回
+    /// 「more than one device/emulator」，清理会静默失效 —— 残留的旧 server 会一直
+    /// 占用音频采集，导致新会话拿不到声音。因此这里必须逐台设备带上 `-s` 执行。
+    private func cleanupPhoneServer(serial: String? = nil, endingSession: UInt64? = nil) {
         // 旧会话的收尾可能晚于新会话启动，此时不能杀掉新会话刚拉起的采集进程
         if let endingSession {
             let current: UInt64 = Thread.isMainThread ? sessionID : DispatchQueue.main.sync { self.sessionID }
             if current != endingSession { return }
         }
-        let out = runADB(["shell", "ps", "-A", "-o", "PID,ARGS"])
-        for line in out.split(separator: "\n")
-            where line.contains("com.genymobile.scrcpy.Server") && line.contains("video=false") {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-            if let pid = parts.first, pid.allSatisfy(\.isNumber) {
-                _ = runADB(["shell", "kill", "-9", String(pid)])
+        let targets: [String]
+        if let serial {
+            targets = [serial]
+        } else {
+            // 未指定设备：遍历当前在线的所有设备，逐台清理
+            targets = adbDeviceSerials()
+            guard !targets.isEmpty else { return }
+        }
+        for target in targets {
+            let out = runADB(["-s", target, "shell", "ps", "-A", "-o", "PID,ARGS"])
+            for line in out.split(separator: "\n")
+                where line.contains("com.genymobile.scrcpy.Server") && line.contains("video=false") {
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                if let pid = parts.first, pid.allSatisfy(\.isNumber) {
+                    _ = runADB(["-s", target, "shell", "kill", "-9", String(pid)])
+                }
             }
         }
     }
@@ -1077,6 +1100,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         phoneVolTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.pollPhoneVolume()
         }
+        // 播放器默认增益为 0（避免启动瞬间突兀出声），这里立即查一次音量，
+        // 拿到真实档位后马上套用增益，不用干等第一个 3 秒周期。
+        pollPhoneVolume()
     }
 
     private func pollPhoneVolume() {
@@ -1096,12 +1122,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.async {
                 self.volumeQueryInFlight = false
-                guard self.activeDevice == device, index >= 0, maxIndex > 0 else { return }
+                guard self.activeDevice == device else { return }
+                guard index >= 0, maxIndex > 0 else {
+                    // 读不到音量（adb 忙 / 设备不支持）：连续失败 3 次后回落满增益，
+                    // 否则默认增益 0 会让用户永远听不到声音。
+                    self.volumeQueryFailures += 1
+                    if self.volumeQueryFailures >= 3 {
+                        self.coreAudioPlayer?.setGain(1)
+                    }
+                    return
+                }
+                self.volumeQueryFailures = 0
                 self.phoneVolValue.stringValue = "手机 \(index)/\(maxIndex)"
                 self.phoneVolValue.textColor = index == 0 ? C_DIM : C_GREEN
-                // Android 音乐音量近似感知曲线：振幅 ≈ (档位/最大值)²
+                // Android 音量档位 → 增益。直接套平方感知曲线时，低档位会被压到几乎无声：
+                // 例如小米平板的 10/150 → 0.004，相当于静音，表现为「刚开始有声、下一秒就没了」。
+                // 这里用「35% 保底 + 剩余部分按平方曲线」映射，既保留跟随手感，又保证听得见。
                 let ratio = Double(index) / Double(maxIndex)
-                self.coreAudioPlayer?.setGain(index == 0 ? 0 : Float(ratio * ratio))
+                let gain = index == 0 ? 0.0 : 0.35 + 0.65 * ratio * ratio
+                self.coreAudioPlayer?.setGain(Float(gain))
             }
         }
     }
@@ -1976,8 +2015,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             env.removeValue(forKey: "ITRAE_PCM_SOCKET")
 
             guard self.isCurrentSession(id), !self.stopping else { return }
-            self.cleanupPhoneServer()
-            self.savedPhoneVolume = self.phoneMediaVolume()
+            self.cleanupPhoneServer(serial: device)
+            self.savedPhoneVolume = self.phoneMediaVolume(serial: device)
 
             if engine == "Native" {
                 var nativeSocket: String?
@@ -2394,6 +2433,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let player = coreAudioPlayer
         // 记录本次要收尾的会话号：旧会话的异步清理不能杀掉新会话刚拉起的采集进程
         let endedSession = sessionID
+        // 主线程先抓取目标设备，避免后台队列读取 activeDevice 造成竞争
+        let endedDevice = activeDevice
 
         let stopClientAndSession = {
             DispatchQueue.global().async {
@@ -2409,9 +2450,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                self.cleanupPhoneServer(endingSession: endedSession)
-                if let saved = self.savedPhoneVolume, self.phoneMediaVolume() == 0 {
-                    self.setPhoneMediaVolume(saved)
+                self.cleanupPhoneServer(serial: endedDevice, endingSession: endedSession)
+                if let saved = self.savedPhoneVolume, self.phoneMediaVolume(serial: endedDevice) == 0 {
+                    self.setPhoneMediaVolume(saved, serial: endedDevice)
                 }
                 self.savedPhoneVolume = nil
 
@@ -2437,6 +2478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         phoneVolTimer?.invalidate()
         phoneVolTimer = nil
         volumeQueryInFlight = false
+        volumeQueryFailures = 0
         heartbeatFailures = 0
         lastPCMBytes = 0
         lastPCMAt = Date.distantPast

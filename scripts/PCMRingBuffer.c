@@ -59,8 +59,8 @@ PCMRingBuffer *pcm_ring_create(size_t capacityFrames) {
     atomic_init(&ring->state, PCMRingStatePriming);
     atomic_init(&ring->gain, 0.0f);
     atomic_init(&ring->fadeRemaining, 0);
-    atomic_init(&ring->userGain, 1.0f);
-    ring->userGainCurrent = 1.0f;
+    atomic_init(&ring->userGain, 0.0f);
+    ring->userGainCurrent = 0.0f;
     return ring;
 }
 
@@ -203,15 +203,20 @@ static void pcm_ring_start_playing(PCMRingBuffer *ring) {
 
 uint32_t pcm_ring_render(PCMRingBuffer *ring, float *left, float *right,
                          size_t frameCount) {
-    if (!ring || !left || !right) {
-        return PCMRingStateStopped;
+    // 返回值语义是「已填充的帧数」。任何提前返回都必须返回 0，
+    // 不能返回状态枚举值（Priming=0 侥幸正确，Rebuffering=2 会让调用方误判填了 2 帧）。
+    if (!left || !right) {
+        return 0;
     }
     memset(left, 0, frameCount * sizeof(float));
     memset(right, 0, frameCount * sizeof(float));
+    if (!ring) {
+        return 0;
+    }
 
     uint32_t state = pcm_ring_load_state(ring);
     if (state == PCMRingStateStopped) {
-        return state;
+        return 0;
     }
 
     uint64_t writeIndex = atomic_load_explicit(&ring->writePosition,
@@ -226,7 +231,7 @@ uint32_t pcm_ring_render(PCMRingBuffer *ring, float *left, float *right,
         size_t target = atomic_load_explicit(&ring->targetFrames,
                                              memory_order_acquire);
         if (available < target || available == 0) {
-            return state;
+            return 0;
         }
         pcm_ring_start_playing(ring);
         state = PCMRingStatePlaying;
@@ -249,6 +254,20 @@ uint32_t pcm_ring_render(PCMRingBuffer *ring, float *left, float *right,
                 fadeRemaining = 0;
                 state = PCMRingStateStopped;
                 atomic_store_explicit(&ring->state, state, memory_order_release);
+            } else if (produced > 0) {
+                // 欠载：环形缓冲被读空。若就此交给上层，波形会从当前幅度硬切到 0；
+                // 下批数据到达后又从 0 硬跳回满幅 —— 两次阶跃都会产生咔哒声。
+                // 这里把本次已产出的最后一小段做淡出，并标记下次渲染时淡入，两端都平滑。
+                size_t fade = produced < PCM_RING_FADE_FRAMES ? produced
+                                                             : PCM_RING_FADE_FRAMES;
+                for (size_t i = 0; i < fade; ++i) {
+                    float g = (float) i / (float) fade;
+                    size_t idx = produced - fade + i;
+                    left[idx] *= g;
+                    right[idx] *= g;
+                }
+                gain = 0.0f;
+                fadeRemaining = PCM_RING_FADE_FRAMES;
             }
             break;
         }
