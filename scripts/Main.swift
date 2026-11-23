@@ -224,6 +224,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var isPausedOffline = false
     /// 手机音量跟随
     var phoneVolTimer: Timer?
+    /// 音量推送通道：server 端 VolumeWatcher 经 abstract socket 推送，桌面端 adb forward 接入。
+    /// 正常路径零 adb 调用；仅在推送未就绪时才回退到 phoneVolTimer 轮询。
+    var volumeWatchPort = -1
+    var volumeWatchActive = false
+    var volumeWatchFallbackTimer: Timer?
     var volumeQueryInFlight = false
     /// 连续读不到手机音量时的计数：用于兜底恢复满增益，避免默认增益 0 导致永久无声
     var volumeQueryFailures = 0
@@ -1145,7 +1150,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 心跳：以「音频流是否仍在到达 PCM」作为主信号。
+    // MARK: - 音量推送通道（server 端 VolumeWatcher）
+
+    /// 建立 adb forward 并在后台持续读取推送行。
+    /// scrcpy server 需要先启动才会 bind 抽象 socket，所以连接可能被拒，读循环里按 400ms 重连。
+    private func startVolumeWatcher(device: String, session id: UInt64) {
+        volumeWatchActive = false
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let out = self.runADB(["-s", device, "forward", "tcp:0",
+                                   "localabstract:transaudio_vol"], timeout: 6)
+            guard let port = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return
+            }
+            DispatchQueue.main.async { self.volumeWatchPort = port }
+            while self.isCurrentSession(id), !self.stopping {
+                self.readVolumeStream(port: port, session: id)
+                usleep(400_000)
+            }
+        }
+    }
+
+    /// 读取推送流直到断开。返回后由 startVolumeWatcher 决定是否重连。
+    private func readVolumeStream(port: Int, session id: UInt64) {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else { return }
+
+        var buffer = [UInt8](repeating: 0, count: 512)
+        var pending = ""
+        while isCurrentSession(id), !stopping {
+            let n = read(fd, &buffer, buffer.count)
+            if n <= 0 { return }
+            pending += String(decoding: buffer[0..<n], as: UTF8.self)
+            while let nl = pending.firstIndex(of: "\n") {
+                let line = String(pending[..<nl])
+                pending = String(pending[pending.index(after: nl)...])
+                applyVolumePush(line, session: id)
+            }
+        }
+    }
+
+    /// 解析 `V <index> <max>` 并套用与轮询一致的增益映射。
+    private func applyVolumePush(_ line: String, session id: UInt64) {
+        let parts = line.split(separator: " ")
+        guard parts.count == 3, parts[0] == "V",
+              let index = Int(parts[1]), let maxIndex = Int(parts[2]), maxIndex > 0 else { return }
+        DispatchQueue.main.async {
+            guard self.isCurrentSession(id), self.coreAudioPlayer != nil else { return }
+            self.volumeWatchActive = true
+            self.volumeWatchFallbackTimer?.invalidate()
+            self.phoneVolTimer?.invalidate()
+            self.volumeQueryFailures = 0
+            self.phoneVolValue.stringValue = "手机 \(index)/\(maxIndex)"
+            self.phoneVolValue.textColor = index == 0 ? C_DIM : C_GREEN
+            let ratio = Double(index) / Double(maxIndex)
+            let gain = index == 0 ? 0.0 : 0.35 + 0.65 * ratio * ratio
+            self.coreAudioPlayer?.setGain(Float(gain))
+        }
+    }
+
+    /// 推送通道就绪前挂一个 5 秒兜底：若一条推送都没收到（例如仍在用旧版 server jar），
+    /// 回退到 adb 轮询，保证音量跟随不会因 jar 未更新而完全失效。
+    private func scheduleVolumeWatchFallback(session id: UInt64) {
+        volumeWatchFallbackTimer?.invalidate()
+        volumeWatchActive = false
+        volumeWatchFallbackTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+            guard let self, self.isCurrentSession(id), !self.volumeWatchActive else { return }
+            self.appendDiagnostic("音量推送通道未就绪，回退到 adb 轮询")
+            self.startPhoneVolumePolling()
+        }
+    }
     ///
     /// 为什么不再每次都跑 `adb shell`：
     /// adbd 的 ShellService 是串行处理 shell 请求的，而音量跟随等功能也在占用它，
@@ -1877,7 +1963,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actionButton.title = "… CONNECTING"
         statusValue.stringValue = "CONNECTING…"
         statusValue.textColor = C_YELLOW
-        startPhoneVolumePolling()
+        // 音量优先走 server 端推送（零 adb 开销）；若推送通道未就绪再回退轮询
+        scheduleVolumeWatchFallback(session: id)
 
         DispatchQueue.global().async { [self] in
             var dev: String?
@@ -2059,6 +2146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 env["ITRAE_PCM_SOCKET"] = nativeSocket
             }
+
+            // 音量推送：server 端 VolumeWatcher 监听本地音量并通过独立 abstract socket 推送，
+            // 桌面端用 adb forward 接入。整体零 adb shell 调用，不会干扰音频编码线程。
+            self.startVolumeWatcher(device: device, session: id)
 
             // 启动客户端；始终保留 stderr 尾部，把“状态码 0/1”翻译成可读原因。
             let p = Process()
@@ -2477,6 +2568,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uiTimer = nil
         phoneVolTimer?.invalidate()
         phoneVolTimer = nil
+        volumeWatchFallbackTimer?.invalidate()
+        volumeWatchFallbackTimer = nil
+        volumeWatchActive = false
+        volumeWatchPort = -1
         volumeQueryInFlight = false
         volumeQueryFailures = 0
         heartbeatFailures = 0
